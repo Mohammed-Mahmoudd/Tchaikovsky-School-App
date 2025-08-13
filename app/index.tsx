@@ -1,5 +1,5 @@
 // App.tsx
-import React, { useEffect, useLayoutEffect, useRef, useState } from "react";
+import React, { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import "./globals.css";
 // 1. Add these imports at the top of your file
 import AsyncStorage from "@react-native-async-storage/async-storage";
@@ -94,14 +94,26 @@ interface FileItem {
   uploadedAt: string;
   uploadedBy: string;
 }
+// First, update your types to include subfolders
+interface SubfolderItem {
+  id: string;
+  name: string;
+  description?: string;
+  files: FileItem[];
+  created_at: string;
+  parent_folder_id: string; // Reference to parent folder
+}
 
 interface FolderItem {
   id: string;
   name: string;
-  files: FileItem[];
-  created_at: string;
   description?: string;
+  files: FileItem[];
+  subfolders: SubfolderItem[]; // Add subfolders array
+  created_at: string;
 }
+
+
 
 // Type definitions
 interface Student {
@@ -276,6 +288,119 @@ const folderDescriptionRef = useRef<TextInput>(null);
 const folderNameRefValue = useRef("");
 const folderDescriptionRefValue = useRef("");
 
+const performFileDeleteFromSubfolder = async (folderId: string, subfolderId: string, fileId: string) => {
+  const folder = adminFiles.find(f => f.id === folderId);
+  if (!folder) return;
+  
+  const subfolder = folder.subfolders.find(sf => sf.id === subfolderId);
+  if (!subfolder) return;
+
+  const fileToDelete = subfolder.files.find(f => f.id === fileId);
+  if (!fileToDelete) return;
+
+  try {
+    // Delete from Storage
+    const storagePath = fileToDelete.url.split("/instructor-files/")[1];
+    const { error: storageError } = await supabase.storage
+      .from("instructor-files")
+      .remove([storagePath]);
+
+    if (storageError) {
+      console.error("Storage delete error:", storageError);
+      Alert.alert("Error", "Failed to delete file from storage");
+      return;
+    }
+
+    // Update subfolder in Supabase
+    const updatedFiles = subfolder.files.filter(f => f.id !== fileId);
+    const { error: dbError } = await supabase
+      .from("subfolders")
+      .update({ files: updatedFiles })
+      .eq("id", subfolderId);
+
+    if (dbError) {
+      console.error("Database update error:", dbError);
+      Alert.alert("Error", "Failed to update subfolder in database");
+      return;
+    }
+
+    // Update state
+    setAdminFiles(prevFiles =>
+      prevFiles.map(f =>
+        f.id === folderId ? {
+          ...f,
+          subfolders: f.subfolders.map(sf =>
+            sf.id === subfolderId ? { ...sf, files: updatedFiles } : sf
+          )
+        } : f
+      )
+    );
+
+    // Update selected subfolder if viewing it
+    if (selectedSubfolder?.id === subfolderId) {
+      setSelectedSubfolder(prev => prev ? { ...prev, files: updatedFiles } : null);
+    }
+
+    Alert.alert("Success", "File deleted successfully");
+  } catch (error) {
+    console.error("Unexpected error during file deletion:", error);
+    Alert.alert("Error", "An unexpected error occurred while deleting the file");
+  }
+};
+
+// Delete subfolder function
+const deleteSubfolder = async (folderId: string, subfolderId: string) => {
+  const folder = adminFiles.find(f => f.id === folderId);
+  if (!folder) return;
+  
+  const subfolder = folder.subfolders.find(sf => sf.id === subfolderId);
+  if (!subfolder) return;
+
+  Alert.alert(
+    "Delete Subfolder",
+    `Are you sure you want to delete "${subfolder.name}" and all its files? This action cannot be undone.`,
+    [
+      {
+        text: "Cancel",
+        style: "cancel",
+      },
+      {
+        text: "Delete",
+        style: "destructive",
+        onPress: async () => {
+          // Delete all files from Storage
+          const storagePaths = subfolder.files.map(f =>
+            f.url.split("/instructor-files/")[1]
+          );
+          if (storagePaths.length > 0) {
+            await supabase.storage.from("instructor-files").remove(storagePaths);
+          }
+
+          // Delete subfolder from database
+          await supabase.from("subfolders").delete().eq("id", subfolderId);
+
+          // Update state
+          setAdminFiles(prevFiles => 
+            prevFiles.map(f =>
+              f.id === folderId
+                ? { ...f, subfolders: f.subfolders.filter(sf => sf.id !== subfolderId) }
+                : f
+            )
+          );
+
+          if (selectedSubfolder?.id === subfolderId) {
+            setSelectedSubfolder(null);
+          }
+
+          Alert.alert("Success", "Subfolder deleted successfully");
+          setSelectedFolder(null)
+        }
+      }
+    ]
+  );
+};
+
+
 
 
   // Add these state variables in your MusicInstructorApp component
@@ -287,10 +412,36 @@ const [adminFiles, setAdminFiles] = useState<FolderItem[]>([]);
 const [selectedFolder, setSelectedFolder] = useState<FolderItem | null>(null);
 const [isCreatingFolder, setIsCreatingFolder] = useState(false);
 const [newFolderName, setNewFolderName] = useState("");
+const [currentFolder, setCurrentFolder] = useState<FolderItem | null>(null);
 const [newFolderDescription, setNewFolderDescription] = useState("");
 const [uploadingFiles, setUploadingFiles] = useState<Set<string>>(new Set());
 
 
+// Updated delete functions for subfolders
+const deleteFileFromSubfolder = async (folderId: string, subfolderId: string, fileId: string, fileName?: string) => {
+  Alert.alert(
+    "Delete File",
+    `Are you sure you want to delete "${fileName || 'this file'}"? This action cannot be undone.`,
+    [
+      {
+        text: "Cancel",
+        style: "cancel",
+      },
+      {
+        text: "Delete",
+        style: "destructive",
+        onPress: async () => {
+          try {
+            await performFileDeleteFromSubfolder(folderId, subfolderId, fileId);
+          } catch (error) {
+            console.error("Delete error:", error);
+            Alert.alert("Error", "Failed to delete file. Please try again.");
+          }
+        }
+      }
+    ]
+  );
+};
 
   const [currentUser, setCurrentUser] = useState<{
     id: string;
@@ -455,6 +606,14 @@ const downloadAndOpenFile = async (url: string, fileName: string) => {
     useState<SessionProgress | null>(null);
   const [dataLoaded, setDataLoaded] = useState(false);
   const [keepLoggedIn, setKeepLoggedIn] = useState(false);
+  // Add these state variables to your component
+const [selectedSubfolder, setSelectedSubfolder] = useState<SubfolderItem | null>(null);
+const [isCreatingSubfolder, setIsCreatingSubfolder] = useState(false);
+const subfolderNameRef = useRef<TextInput>(null);
+const subfolderDescriptionRef = useRef<TextInput>(null);
+const subfolderNameRefValue = useRef("");
+const subfolderDescriptionRefValue = useRef("");
+
   const [editStudentForm, setEditStudentForm] = useState<StudentForm>({
     name: "",
     instrument: "",
@@ -691,11 +850,13 @@ const toggleGroupExpand = (groupType: string) => {
         if (keepLoggedIn) {
           await AsyncStorage.setItem("keepLoggedIn", "true");
           await AsyncStorage.setItem("initialScreen", "student-dashboard");
+          console.log("student-dashboard in if condition")
         }
-
+        
         setLoading(false);
         setCurrentScreen("student-dashboard");
         loadStudentSessionData(studentData.id);
+        console.log("student-dashboard")
         return;
       }
 
@@ -724,10 +885,12 @@ const toggleGroupExpand = (groupType: string) => {
         if (keepLoggedIn) {
           await AsyncStorage.setItem("keepLoggedIn", "true");
           await AsyncStorage.setItem("initialScreen", "dashboard");
+          console.log("instructor Screen here in if condi")
         }
-
+        
         setLoading(false);
         setCurrentScreen("dashboard");
+        console.log("instructor Screen")
         return;
       }
 
@@ -768,10 +931,8 @@ const toggleGroupExpand = (groupType: string) => {
       const { data: studentData, error: studentError } = await supabase
         .from("students")
         .select(
-          `*,
-           online_instructor:online_instructor_id(name),
-           theory_instructor:theory_instructor_id(name),
-           in_person_instructor:in_person_id(name)`
+          "*"
+           
         )
         .eq("user_id", user.id)
         .single();
@@ -824,20 +985,296 @@ const toggleGroupExpand = (groupType: string) => {
 
   checkSessionAndLoadData();
 }, []);
+const createNewSubfolder = async (parentFolderId: string) => {
+  type NewSubfolderItem = Omit<SubfolderItem, "id">;
+
+  const newSubfolder: NewSubfolderItem = {
+    name: subfolderNameRefValue.current.trim(),
+    description: subfolderDescriptionRefValue.current.trim(),
+    files: [],
+    created_at: new Date().toISOString(),
+    parent_folder_id: parentFolderId,
+  };
+
+  const { data, error } = await supabase
+    .from("subfolders")
+    .insert([newSubfolder])
+    .select();
+
+  if (error) {
+    console.error("❌ Insert error:", error);
+    Alert.alert("Error", error.message);
+    return;
+  }
+
+  if (data && data.length > 0) {
+    setAdminFiles(prev => 
+      prev.map(folder => 
+        folder.id === parentFolderId
+          ? { ...folder, subfolders: [...folder.subfolders, ...data] }
+          : folder
+      )
+    );
+  }
+
+  subfolderNameRefValue.current = "";
+  subfolderDescriptionRefValue.current = "";
+  subfolderNameRef.current?.clear();
+  subfolderDescriptionRef.current?.clear();
+  setIsCreatingSubfolder(false);
+
+  Alert.alert("Success", "Subfolder created successfully!");
+  setSelectedFolder(null)
+};
+
+// Updated Folder Details View (showing subfolders)
+const RenderFolderDetailsView = () => {
+  if (!selectedFolder) return null;
+
+  return (
+    <SafeAreaView className="flex-1 bg-gray-50">
+      {/* Header */}
+      <View className="bg-white shadow-sm">
+        <View className="px-4 py-6">
+          <View className="flex-row items-center justify-between">
+            <View className="flex-row items-center">
+              <TouchableOpacity
+                onPress={() => {setSelectedFolder(null);setCurrentFolder(null) }}
+                className="mr-3 p-2"
+              >
+                <Ionicons name="chevron-back" size={24} color="#6B7280" />
+              </TouchableOpacity>
+              <View>
+                <Text className="text-2xl font-bold text-gray-800">
+                  {selectedFolder.name}
+                </Text>
+                <Text className="text-gray-600 mt-1">
+                  {selectedFolder.subfolders.length} subfolders • {selectedFolder.files.length} files
+                </Text>
+              </View>
+            </View>
+            <View className="flex-row items-center">
+              <TouchableOpacity
+                onPress={() => setIsCreatingSubfolder(true)}
+                className="bg-purple-500 px-3 py-2 rounded-full flex-row items-center mr-2"
+              >
+                <Ionicons name="add" size={14} color="white" />
+                <Text className="text-white font-medium ml-1 text-sm">Subfolder</Text>
+              </TouchableOpacity>
+              <TouchableOpacity
+                onPress={() => handleMultipleFileUpload(selectedFolder.id)}
+                disabled={uploadingFiles.has(selectedFolder.id)}
+                className="bg-blue-500 px-4 py-2 rounded-full flex-row items-center"
+              >
+                {uploadingFiles.has(selectedFolder.id) ? (
+                  <ActivityIndicator size="small" color="white" />
+                ) : (
+                  <>
+                    <Ionicons name="cloud-upload" size={16} color="white" />
+                    <Text className="text-white font-medium ml-2">Upload</Text>
+                  </>
+                )}
+              </TouchableOpacity>
+            </View>
+          </View>
+        </View>
+      </View>
+
+      <ScrollView className="flex-1 px-4 py-4">
+        {/* Subfolders Section */}
+        {selectedFolder.subfolders.length > 0 && (
+          <View className="mb-6">
+            <Text className="text-lg font-semibold text-gray-800 mb-3">Subfolders</Text>
+            <View className="space-y-2">
+              {selectedFolder.subfolders.map((subfolder) => (
+                <TouchableOpacity
+                  key={subfolder.id}
+                  onPress={() => setSelectedSubfolder(subfolder)}
+                  className="bg-white rounded-xl shadow-sm p-4"
+                >
+                  <View className="flex-row items-center justify-between">
+                    <View className="flex-row items-center flex-1">
+                      <View className="w-10 h-10 bg-purple-500 rounded-full items-center justify-center mr-3">
+                        <Ionicons name="folder" size={20} color="white" />
+                      </View>
+                      <View className="flex-1">
+                        <Text className="text-gray-800 font-medium">
+                          {subfolder.name}
+                        </Text>
+                        <Text className="text-gray-600 text-sm">
+                          {subfolder.files.length} files
+                        </Text>
+                      </View>
+                    </View>
+                    <View className="flex-row items-center">
+                      <TouchableOpacity
+                        onPress={(e) => {
+                          e.stopPropagation();
+                          deleteSubfolder(selectedFolder.id, subfolder.id);
+                        }}
+                        className="p-2 mr-2"
+                      >
+                        <Ionicons name="trash-outline" size={18} color="#EF4444" />
+                      </TouchableOpacity>
+                      <Ionicons name="chevron-forward" size={18} color="#6B7280" />
+                    </View>
+                  </View>
+                </TouchableOpacity>
+              ))}
+            </View>
+          </View>
+        )}
+
+        {/* Files Section */}
+        {selectedFolder.files.length > 0 && (
+          <View>
+            <Text className="text-lg font-semibold text-gray-800 mb-3">Files</Text>
+            <View className="space-y-2">
+              {selectedFolder.files.map((file) => (
+                <View key={file.id} className="bg-white rounded-xl shadow-sm p-4">
+                  <View className="flex-row items-center justify-between">
+                    <View className="flex-row items-center flex-1">
+                      <View className="w-10 h-10 bg-blue-100 rounded-full items-center justify-center mr-3">
+                        <Ionicons 
+                          name={getFileIcon(file.type)} 
+                          size={18} 
+                          color="#3B82F6" 
+                        />
+                      </View>
+                      <View className="flex-1">
+                        <Text className="text-gray-800 font-medium" numberOfLines={1}>
+                          {file.name}
+                        </Text>
+                        <Text className="text-gray-500 text-sm">
+                          {formatFileSize(file.size)}
+                        </Text>
+                      </View>
+                    </View>
+                    <View className="flex-row items-center">
+                      <TouchableOpacity
+                        onPress={() => openFile(file.url, file.name)}
+                        className="p-2 mr-2"
+                      >
+                        <Ionicons name="eye-outline" size={18} color="#6B7280" />
+                      </TouchableOpacity>
+                      <TouchableOpacity
+                        onPress={() => deleteFile(selectedFolder.id, file.id, file.name)}
+                        className="p-2"
+                      >
+                        <Ionicons name="trash-outline" size={18} color="#EF4444" />
+                      </TouchableOpacity>
+                    </View>
+                  </View>
+                </View>
+              ))}
+            </View>
+          </View>
+          
+        )}
+
+        {/* Empty State */}
+        {selectedFolder.subfolders.length === 0 && selectedFolder.files.length === 0 && (
+          <View className="flex-1 items-center justify-center py-20">
+            <View className="w-20 h-20 bg-gray-200 rounded-full items-center justify-center mb-4">
+              <Ionicons name="folder-open-outline" size={40} color="#9CA3AF" />
+            </View>
+            <Text className="text-gray-500 text-lg font-medium">Empty folder</Text>
+            <Text className="text-gray-400 text-center mt-2 px-8">
+              Create subfolders or upload files to get started
+            </Text>
+          </View>
+        )}
+      </ScrollView>
+
+      {/* Create Subfolder Modal */}
+      <Modal
+        visible={isCreatingSubfolder}
+        transparent={true}
+        animationType="fade"
+        onRequestClose={() => setIsCreatingSubfolder(false)}
+      >
+        <TouchableOpacity 
+          className="flex-1 bg-black/50 items-center justify-center p-4"
+          activeOpacity={1}
+          onPress={() => setIsCreatingSubfolder(false)}
+        >
+          <TouchableOpacity 
+            className="bg-white rounded-2xl p-6 w-full max-w-sm"
+            activeOpacity={1}
+            onPress={(e) => e.stopPropagation()}
+          >
+            <Text className="text-xl font-bold text-gray-800 mb-4">
+              Create Subfolder
+            </Text>
+            
+            <View className="mb-4">
+              <Text className="text-gray-700 font-medium mb-2">Subfolder Name</Text>
+              <TextInput
+                ref={subfolderNameRef}
+                defaultValue=""
+                onChangeText={(text) => {
+                  subfolderNameRefValue.current = text;
+                }}
+                placeholder="Enter subfolder name"
+                className="border border-gray-300 rounded-xl px-4 py-3 text-gray-800"
+                returnKeyType="next"
+                onSubmitEditing={() => {
+                  subfolderDescriptionRef.current?.focus();
+                }}
+              />
+            </View>
+
+            <View className="mb-6">
+              <Text className="text-gray-700 font-medium mb-2">Description (Optional)</Text>
+              <TextInput
+                ref={subfolderDescriptionRef}
+                defaultValue=""
+                onChangeText={(text) => {
+                  subfolderDescriptionRefValue.current = text;
+                }}
+                placeholder="Enter subfolder description"
+                className="border border-gray-300 rounded-xl px-4 py-3 text-gray-800"
+                multiline
+                numberOfLines={3}
+                textAlignVertical="top"
+                returnKeyType="done"
+              />
+            </View>
+
+            <View className="flex-row space-x-3">
+              <TouchableOpacity
+                onPress={() => setIsCreatingSubfolder(false)}
+                className="flex-1 bg-gray-200 py-3 rounded-xl items-center"
+              >
+                <Text className="text-gray-700 font-medium">Cancel</Text>
+              </TouchableOpacity>
+              <TouchableOpacity
+                onPress={() => createNewSubfolder(selectedFolder.id)}
+                className="flex-1 bg-purple-500 py-3 rounded-xl items-center ml-3"
+              >
+                <Text className="text-white font-medium">Create</Text>
+              </TouchableOpacity>
+            </View>
+          </TouchableOpacity>
+        </TouchableOpacity>
+      </Modal>
+    </SafeAreaView>
+  );
+};
 
 // Add this function to handle multiple file uploads
-const handleMultipleFileUpload = async (folderId: string) => {
+const handleMultipleFileUpload = async (folderId: string, subfolderId?: string) => {
   try {
     const result = await DocumentPicker.getDocumentAsync({
       type: "*/*",
       copyToCacheDirectory: true,
       multiple: true,
     });
+    
     if (!result.canceled && result.assets.length > 0) {
-      setUploadingFiles(new Set([folderId]));
+      setUploadingFiles(new Set([subfolderId || folderId]));
       
       const uploadPromises = result.assets.map(async (file) => {
-        console.log(folderId)
         const uploadedUrl = await uploadFileToFolder(file, folderId);
         
         if (uploadedUrl) {
@@ -850,7 +1287,6 @@ const handleMultipleFileUpload = async (folderId: string) => {
             uploadedAt: new Date().toISOString(),
             uploadedBy: "Admin",
           };
-
           return newFile;
         }
         return null;
@@ -860,40 +1296,63 @@ const handleMultipleFileUpload = async (folderId: string) => {
       const validFiles = uploadedFiles.filter((file): file is FileItem => file !== null);
 
       if (validFiles.length > 0) {
-        setAdminFiles(prevFiles => 
-          prevFiles.map(folder => 
-            folder.id === folderId 
-              ? { ...folder, files: [...folder.files, ...validFiles] }
-              : folder
-          )
-        );
-
-       if (validFiles.length > 0) {
-  const updatedFolders = adminFiles.map(folder =>
-    folder.id === folderId
-      ? { ...folder, files: [...folder.files, ...validFiles] }
-      : folder
-  );
-  setAdminFiles(updatedFolders);
-
-  await supabase
-    .from("folders")
-    .update({ files: updatedFolders.find(f => f.id === folderId)?.files })
-    .eq("id", folderId);
-    
-    Alert.alert("Success", `${validFiles.length} file(s) uploaded successfully!`);
-    await fetchFolders();  // ← تعيد تحميل البيانات المحدثة من القاعدة
-    setSelectedFolder(null)
-  }
-}
-
-setUploadingFiles(new Set());
+        if (subfolderId) {
+          // Upload to subfolder
+          setAdminFiles(prevFiles => 
+            prevFiles.map(folder => 
+              folder.id === folderId 
+                ? {
+                    ...folder,
+                    subfolders: folder.subfolders.map(subfolder =>
+                      subfolder.id === subfolderId
+                        ? { ...subfolder, files: [...subfolder.files, ...validFiles] }
+                        : subfolder
+                    )
+                  }
+                : folder
+            )
+          );
+          
+          // Update subfolder in Supabase
+          const updatedSubfolder = selectedSubfolder ? {
+            ...selectedSubfolder,
+            files: [...selectedSubfolder.files, ...validFiles]
+          } : null;
+          
+          if (updatedSubfolder) {
+            await supabase
+              .from("subfolders")
+              .update({ files: updatedSubfolder.files })
+              .eq("id", subfolderId);
+          }
+        } else {
+          // Upload to main folder
+          setAdminFiles(prevFiles => 
+            prevFiles.map(folder => 
+              folder.id === folderId 
+                ? { ...folder, files: [...folder.files, ...validFiles] }
+                : folder
+            )
+          );
+          
+          await supabase
+            .from("folders")
+            .update({ files: adminFiles.find(f => f.id === folderId)?.files })
+            .eq("id", folderId);
+        }
+        
+        Alert.alert("Success", `${validFiles.length} file(s) uploaded successfully!`);
+        await fetchFolders();
+        if (subfolderId) {
+          setSelectedSubfolder(prev => prev ? { ...prev, files: [...prev.files, ...validFiles] } : null);
+        }
+      }
+      setUploadingFiles(new Set());
     }
   } catch (err) {
     setUploadingFiles(new Set());
   }
 };
-
 
   const createNewFolder = async () => {
     console.log("📌 folderNameRefValue:", folderNameRefValue.current);
@@ -903,11 +1362,12 @@ setUploadingFiles(new Set());
 
 
     const newFolder: NewFolderItem = {
-    name: folderNameRefValue.current.trim(),
-    description: folderDescriptionRefValue.current.trim(),
-    files: [],
-    created_at: new Date().toISOString(),
-  };
+      name: folderNameRefValue.current.trim(),
+      description: folderDescriptionRefValue.current.trim(),
+      files: [],
+      created_at: new Date().toISOString(),
+      subfolders: []
+    };
     const { data, error } = await supabase
   .from("folders")
   .insert([newFolder])
@@ -934,6 +1394,96 @@ Alert.alert("Success", "Folder created successfully!");
 
 
   };
+const handleFolderUpload = async (folderId: string) => {
+  try {
+    const result = await DocumentPicker.getDocumentAsync({
+      type: "*/*",
+      copyToCacheDirectory: true,
+      multiple: true,
+    });
+
+    if (!result.canceled && result.assets.length > 0) {
+      setUploadingFiles(new Set([folderId]));
+
+      const uploadPromises = result.assets.map(async (file) => {
+        const fileExt = file.name.split(".").pop();
+        const fileName = `${Date.now()}-${Math.random().toString(36).substring(2)}.${fileExt}`;
+
+        // رفع الملف على Supabase Storage
+        const { error: uploadError } = await supabase.storage
+          .from("instructor-files")
+          .upload(fileName, {
+            uri: file.uri,
+            type: file.mimeType || "application/octet-stream",
+            name: file.name,
+          } as any);
+
+        if (uploadError) {
+          console.error("❌ Upload error:", uploadError);
+          return null;
+        }
+
+        const { data: publicUrlData } = supabase.storage
+          .from("instructor-files")
+          .getPublicUrl(fileName);
+
+        return {
+          id: Date.now().toString() + Math.random().toString(),
+          name: file.name,
+          url: publicUrlData.publicUrl,
+          size: file.size || 0,
+          type: file.mimeType || "application/octet-stream",
+          uploadedAt: new Date().toISOString(),
+          uploadedBy: "Admin",
+        } as FileItem;
+      });
+
+      const uploadedFiles = await Promise.all(uploadPromises);
+      const validFiles = uploadedFiles.filter((file): file is FileItem => file !== null);
+
+      if (validFiles.length > 0) {
+        // 1️⃣ نجيب الملفات القديمة من الجدول
+        const { data: folderData, error: fetchError } = await supabase
+          .from("folders")
+          .select("files")
+          .eq("id", folderId)
+          .single();
+
+        if (fetchError) {
+          console.error("❌ Fetch folder error:", fetchError);
+        } else {
+          // 2️⃣ نضيف الملفات الجديدة مع القديمة
+          const updatedFiles = [...(folderData.files || []), ...validFiles];
+
+          // 3️⃣ نعمل تحديث للـ column files في جدول folders
+          const { error: updateError } = await supabase
+            .from("folders")
+            .update({ files: updatedFiles })
+            .eq("id", folderId);
+
+          if (updateError) {
+            console.error("❌ Update folder error:", updateError);
+          } else {
+            // 4️⃣ تحديث الـ state عشان البيانات تظهر فورًا
+            setAdminFiles(prevFiles =>
+              prevFiles.map(folder =>
+                folder.id === folderId
+                  ? { ...folder, files: updatedFiles }
+                  : folder
+              )
+            );
+            Alert.alert("✅ Success", `${validFiles.length} file(s) uploaded successfully!`);
+          }
+        }
+      }
+
+      setUploadingFiles(new Set());
+    }
+  } catch (err) {
+    console.error(err);
+    setUploadingFiles(new Set());
+  }
+};
 
 // Updated delete function with alert confirmation
 const deleteFile = async (folderId: string, fileId: string, fileName?: string) => {
@@ -1022,69 +1572,50 @@ const performFileDelete = async (folderId: string, fileId: string) => {
   }
 };
 
-// Alternative version with more detailed confirmation
-const deleteFileDetailed = async (folderId: string, fileId: string, fileName?: string) => {
-  const folder = adminFiles.find(f => f.id === folderId);
-  if (!folder) {
-    Alert.alert("Error", "Folder not found");
-    return;
-  }
 
-  const fileToDelete = folder.files.find(f => f.id === fileId);
-  if (!fileToDelete) {
-    Alert.alert("Error", "File not found");
-    return;
-  }
-
-  // More detailed confirmation with file info
+// Add this function to delete folders
+const deleteFolder = async (folderId: string) => {
   Alert.alert(
-    "⚠️ Delete File",
-    `File: ${fileName || fileToDelete.name || 'Unknown'}
-Folder: ${folder.name}
-
-This will permanently delete the file from storage. Are you sure?`,
+    "Confirm Delete",
+    "Are you sure you want to delete this folder and all its files?",
     [
+      { text: "Cancel", style: "cancel" },
       {
-        text: "Cancel",
-        style: "cancel"
-      },
-      {
-        text: "Delete Forever",
+        text: "Delete",
         style: "destructive",
         onPress: async () => {
           try {
-            await performFileDelete(folderId, fileId);
-          } catch (error) {
-            console.error("Delete error:", error);
-            Alert.alert("Error", "Failed to delete file. Please try again.");
+            const folder = adminFiles.find(f => f.id === folderId);
+            if (!folder) return;
+
+            // حذف كل الملفات من Storage
+            const storagePaths = folder.files.map(f =>
+              f.url.split("/instructor-files/")[1]
+            );
+            if (storagePaths.length > 0) {
+              await supabase.storage.from("instructor-files").remove(storagePaths);
+            }
+
+            // حذف الفولدر من الجدول
+            const { error } = await supabase.from("folders").delete().eq("id", folderId);
+            if (error) throw error;
+
+            // تحديث الـ state
+            setAdminFiles(prevFiles => prevFiles.filter(f => f.id !== folderId));
+            if (selectedFolder?.id === folderId) {
+              setSelectedFolder(null);
+              setCurrentFolder(null);
+            }
+
+            Alert.alert("Success", "Folder deleted successfully ✅");
+          } catch (err) {
+            console.error("❌ Delete error:", err);
+            Alert.alert("Error", "Failed to delete folder ❌");
           }
         }
       }
     ]
   );
-};
-
-// Add this function to delete folders
-const deleteFolder = async (folderId: string) => {
-  const folder = adminFiles.find(f => f.id === folderId);
-  if (!folder) return;
-
-  // حذف كل الملفات من Storage
-  const storagePaths = folder.files.map(f =>
-    f.url.split("/instructor-files/")[1]
-  );
-  if (storagePaths.length > 0) {
-    await supabase.storage.from("instructor-files").remove(storagePaths);
-  }
-
-  // حذف الفولدر من الجدول
-  await supabase.from("folders").delete().eq("id", folderId);
-
-  // تحديث الـ state
-  setAdminFiles(prevFiles => prevFiles.filter(f => f.id !== folderId));
-  if (selectedFolder?.id === folderId) {
-    setSelectedFolder(null);
-  }
 };
 
 // Add this function to format file size
@@ -1106,11 +1637,372 @@ const getFileIcon = (fileType: string) => {
   if (fileType.includes('powerpoint') || fileType.includes('presentation')) return 'easel-outline' as const;
   return 'document-outline' as const;
 };
+// Subfolder View Component
+const RenderSubfolderView = () => {
+  if (!selectedSubfolder || !selectedFolder) return null;
 
-// Admin File Manager Screen Component
+  return (
+    <SafeAreaView className="flex-1 bg-gray-50">
+      {/* Header */}
+      <View className="bg-white shadow-sm">
+        <View className="px-4 py-6">
+          <View className="flex-row items-center justify-between">
+            <View className="flex-row items-center">
+              <TouchableOpacity
+                onPress={() => {setSelectedSubfolder(null); setSelectedFolder(null); setSelectedFolder(currentFolder); fetchFolders;} }
+                className="mr-3 p-2"
+              >
+                <Ionicons name="chevron-back" size={24} color="#6B7280" />
+              </TouchableOpacity>
+              <View>
+                <Text className="text-2xl font-bold text-gray-800">
+                  {selectedSubfolder.name}
+                </Text>
+                <Text className="text-gray-600 mt-1">
+                  {selectedSubfolder.files.length} files in {selectedFolder.name}
+                </Text>
+              </View>
+            </View>
+            <TouchableOpacity
+              onPress={() => handleMultipleFileUpload(selectedFolder.id, selectedSubfolder.id)}
+              disabled={uploadingFiles.has(selectedSubfolder.id)}
+              className="bg-blue-500 px-4 py-2 rounded-full flex-row items-center"
+            >
+              {uploadingFiles.has(selectedSubfolder.id) ? (
+                <ActivityIndicator size="small" color="white" />
+              ) : (
+                <>
+                  <Ionicons name="cloud-upload" size={16} color="white" />
+                  <Text className="text-white font-medium ml-2">Upload</Text>
+                </>
+              )}
+            </TouchableOpacity>
+          </View>
+        </View>
+      </View>
+
+      {/* Files List */}
+      <ScrollView className="flex-1 px-4 py-4">
+        {selectedSubfolder.files.length === 0 ? (
+          <View className="flex-1 items-center justify-center py-20">
+            <View className="w-20 h-20 bg-gray-200 rounded-full items-center justify-center mb-4">
+              <Ionicons name="folder-open-outline" size={40} color="#9CA3AF" />
+            </View>
+            <Text className="text-gray-500 text-lg font-medium">No files yet</Text>
+            <Text className="text-gray-400 text-center mt-2 px-8">
+              Upload files to this subfolder to get started
+            </Text>
+          </View>
+        ) : (
+          <View className="space-y-3">
+            {selectedSubfolder.files.map((file) => (
+              <View key={file.id} className="bg-white rounded-2xl mb-1 shadow-sm p-4">
+                <View className="flex-row items-center justify-between">
+                  <View className="flex-row items-center flex-1">
+                    <View className="w-12 h-12 bg-blue-100 rounded-full items-center justify-center mr-3">
+                      <Ionicons 
+                        name={getFileIcon(file.type)} 
+                        size={20} 
+                        color="#3B82F6" 
+                      />
+                    </View>
+                    <View className="flex-1">
+                      <Text className="text-gray-800 font-medium" numberOfLines={1}>
+                        {file.name}
+                      </Text>
+                      <View className="flex-row items-center mt-1">
+                        <Text className="text-gray-500 text-sm">
+                          {formatFileSize(file.size)}
+                        </Text>
+                        <Text className="text-gray-400 text-sm mx-2">•</Text>
+                        <Text className="text-gray-500 text-sm">
+                          {new Date(file.uploadedAt).toLocaleDateString()}
+                        </Text>
+                      </View>
+                    </View>
+                  </View>
+                  <View className="flex-row items-center">
+                    <TouchableOpacity
+                      onPress={() => openFile(file.url, file.name)}
+                      className="p-2 mr-2"
+                    >
+                      <Ionicons name="eye-outline" size={20} color="#6B7280" />
+                    </TouchableOpacity>
+                    <TouchableOpacity
+                      onPress={() => deleteFileFromSubfolder(selectedFolder.id, selectedSubfolder.id, file.id, file.name)}
+                      className="p-2"
+                    >
+                      <Ionicons name="trash-outline" size={20} color="#EF4444" />
+                    </TouchableOpacity>
+                  </View>
+                </View>
+              </View>
+            ))}
+          </View>
+        )}
+      </ScrollView>
+    </SafeAreaView>
+  );
+};
+
+
+// Admin File Manager Screen Component with Subfolder Support
 const RenderAdminFileManager = () => {
+   
+  const [isEditingFolder, setIsEditingFolder] = useState<boolean>(false);
+const [editingFolder, setEditingFolder] = useState<FolderItem | null>(null);
+const [editFolderName, setEditFolderName] = useState<string>('');
+const editFolderNameRef = useRef<TextInput>(null);
+const handleEditFolder = (folder: FolderItem): void => {
+  setEditingFolder(folder);
+  setEditFolderName(folder.name);
+  setIsEditingFolder(true);
+};
+const [isEditingSubfolder, setIsEditingSubfolder] = useState<boolean>(false);
+const [editingSubfolder, setEditingSubfolder] = useState<SubfolderItem | null>(null);
+const [editSubfolderName, setEditSubfolderName] = useState<string>('');
+const editSubfolderNameRef = useRef<TextInput>(null);
+
+const handleEditSubfolder = (subfolder: SubfolderItem): void => {
+  setEditingSubfolder(subfolder);
+  setEditSubfolderName(subfolder.name);
+  setIsEditingSubfolder(true);
+};
+
+const handleSaveSubfolderEdit = async (): Promise<void> => {
+  if (!editSubfolderName.trim() || !editingSubfolder || !selectedFolder) {
+    Alert.alert('Error', 'Subfolder name cannot be empty');
+    return;
+  }
+  
+  try {
+    const { error } = await supabase
+      .from('subfolders')
+      .update({ name: editSubfolderName.trim() })
+      .eq('id', editingSubfolder.id);
+      
+    if (error) throw error;
+    
+    // Update local state
+    const updatedFolder = {
+      ...selectedFolder,
+      subfolders: selectedFolder.subfolders?.map(subfolder => 
+        subfolder.id === editingSubfolder.id 
+          ? { ...subfolder, name: editSubfolderName.trim() }
+          : subfolder
+      )
+    };
+    setSelectedFolder(updatedFolder);
+    
+    setIsEditingSubfolder(false);
+    setEditingSubfolder(null);
+    setEditSubfolderName('');
+  } catch (error) {
+    console.error('Error updating subfolder name:', error);
+    Alert.alert('Error', 'Failed to update subfolder name');
+  }
+};
+
+
+const handleSaveEdit = async (): Promise<void> => {
+  if (!editFolderName.trim() || !editingFolder) {
+    Alert.alert('Error', 'Folder name cannot be empty');
+    return;
+  }
+  
+  try {
+    const { error } = await supabase
+      .from('folders')
+      .update({ name: editFolderName.trim() })
+      .eq('id', editingFolder.id);
+      
+    if (error) throw error;
+    
+    // Update local state
+    const updatedFolders = adminFiles.map(folder => 
+      folder.id === editingFolder.id 
+        ? { ...folder, name: editFolderName.trim() }
+        : folder
+    );
+    setAdminFiles(updatedFolders);
+    
+    setIsEditingFolder(false);
+    setEditingFolder(null);
+    setEditFolderName('');
+  } catch (error) {
+    console.error('Error updating folder name:', error);
+    Alert.alert('Error', 'Failed to update folder name');
+  }
+};
+  // If viewing a specific file in a subfolder
+  if (selectedSubfolder) {
+    // ADD THIS STATE VARIABLE TO YOUR COMPONENT:
+const [searchQuery, setSearchQuery] = useState('');
+
+// ADD THIS FILTERED FILES LOGIC:
+const filteredFiles = useMemo(() => {
+  if (!searchQuery.trim()) {
+    return selectedSubfolder.files;
+  }
+  
+  return selectedSubfolder.files.filter(file => 
+    file.name.toLowerCase().includes(searchQuery.toLowerCase())
+  );
+}, [selectedSubfolder.files, searchQuery]);
+
+return (
+  <SafeAreaView className="flex-1 bg-gray-50">
+    {/* Header */}
+    <View className="bg-white shadow-sm">
+      <View className="px-4 py-6">
+        <View className="flex-row items-center justify-between">
+          <View className="flex-row items-center">
+            <TouchableOpacity
+              onPress={() => { setSelectedSubfolder(null); setSelectedFolder(null); }}
+              className="mr-3 p-2"
+            >
+              <Ionicons name="chevron-back" size={24} color="#6B7280" />
+            </TouchableOpacity>
+            <View>
+              <Text className="text-2xl font-bold text-gray-800">
+                {selectedSubfolder.name}
+              </Text>
+              <Text className="text-gray-600 mt-1">
+                {selectedSubfolder.files.length} files in {selectedFolder?.name}
+              </Text>
+            </View>
+          </View>
+          <TouchableOpacity
+            onPress={() => handleMultipleFileUpload(selectedFolder?.id || '', selectedSubfolder.id)}
+            disabled={uploadingFiles.has(selectedSubfolder.id)}
+            className="bg-blue-500 px-4 py-2 rounded-full flex-row items-center"
+          >
+            {uploadingFiles.has(selectedSubfolder.id) ? (
+              <ActivityIndicator size="small" color="white" />
+            ) : (
+              <>
+                <Ionicons name="cloud-upload" size={16} color="white" />
+                <Text className="text-white font-medium ml-2">Upload</Text>
+              </>
+            )}
+          </TouchableOpacity>
+        </View>
+      </View>
+
+      {/* Search Bar */}
+      <View className="px-4 pb-4">
+        <View className="flex-row items-center bg-gray-100 rounded-xl px-4 py-3 border border-gray-200">
+          <Ionicons name="search" size={20} color="#9CA3AF" />
+          <TextInput
+            placeholder="Search files..."
+            value={searchQuery}
+            onChangeText={setSearchQuery}
+            className="flex-1 ml-3 text-gray-800 text-base"
+            placeholderTextColor="#9CA3AF"
+            returnKeyType="search"
+          />
+          {searchQuery.length > 0 && (
+            <TouchableOpacity
+              onPress={() => setSearchQuery('')}
+              className="ml-2"
+            >
+              <Ionicons name="close-circle" size={20} color="#9CA3AF" />
+            </TouchableOpacity>
+          )}
+        </View>
+        
+        {/* Search Results Count */}
+        {searchQuery.length > 0 && (
+          <Text className="text-sm text-gray-600 mt-2 px-2">
+            {filteredFiles.length} {filteredFiles.length === 1 ? 'file' : 'files'} found
+          </Text>
+        )}
+      </View>
+    </View>
+
+    {/* Files List */}
+    <ScrollView className="flex-1 px-4 py-4">
+      {filteredFiles.length === 0 ? (
+        <View className="flex-1 items-center justify-center py-20">
+          <View className="w-20 h-20 bg-gray-200 rounded-full items-center justify-center mb-4">
+            <Ionicons 
+              name={searchQuery.length > 0 ? "search" : "folder-open-outline"} 
+              size={40} 
+              color="#9CA3AF" 
+            />
+          </View>
+          <Text className="text-gray-500 text-lg font-medium">
+            {searchQuery.length > 0 ? "No files found" : "No files yet"}
+          </Text>
+          <Text className="text-gray-400 text-center mt-2 px-8">
+            {searchQuery.length > 0 
+              ? "Try adjusting your search terms" 
+              : "Upload files to this subfolder to get started"
+            }
+          </Text>
+          {searchQuery.length > 0 && (
+            <TouchableOpacity
+              onPress={() => setSearchQuery('')}
+              className="mt-4 px-6 py-2 bg-blue-500 rounded-lg"
+            >
+              <Text className="text-white font-medium">Clear Search</Text>
+            </TouchableOpacity>
+          )}
+        </View>
+      ) : (
+        <View className="space-y-3">
+          {filteredFiles.map((file) => (
+            <View key={file.id} className="bg-white rounded-2xl mb-1 shadow-sm p-4">
+              <View className="flex-row items-center justify-between">
+                <View className="flex-row items-center flex-1">
+                  <View className="w-12 h-12 bg-blue-100 rounded-full items-center justify-center mr-3">
+                    <Ionicons 
+                      name={getFileIcon(file.type)} 
+                      size={20} 
+                      color="#3B82F6" 
+                    />
+                  </View>
+                  <View className="flex-1">
+                    <Text className="text-gray-800 font-medium" numberOfLines={1}>
+                      {file.name}
+                    </Text>
+                    <View className="flex-row items-center mt-1">
+                      <Text className="text-gray-500 text-sm">
+                        {formatFileSize(file.size)}
+                      </Text>
+                      <Text className="text-gray-400 text-sm mx-2">•</Text>
+                      <Text className="text-gray-500 text-sm">
+                        {new Date(file.uploadedAt).toLocaleDateString()}
+                      </Text>
+                    </View>
+                  </View>
+                </View>
+                <View className="flex-row items-center">
+                  <TouchableOpacity
+                    onPress={() => openFile(file.url, file.name)}
+                    className="p-2 mr-2"
+                  >
+                    <Ionicons name="eye-outline" size={20} color="#6B7280" />
+                  </TouchableOpacity>
+                  <TouchableOpacity
+                    onPress={() => deleteFileFromSubfolder(selectedFolder?.id || '', selectedSubfolder.id, file.id, file.name)}
+                    className="p-2"
+                  >
+                    <Ionicons name="trash-outline" size={20} color="#EF4444" />
+                  </TouchableOpacity>
+                </View>
+              </View>
+            </View>
+          ))}
+        </View>
+      )}
+    </ScrollView>
+  </SafeAreaView>
+);
+  }
+
+  // If viewing folder details (subfolders + files)
   if (selectedFolder) {
-    // File List View
     return (
       <SafeAreaView className="flex-1 bg-gray-50">
         {/* Header */}
@@ -1119,7 +2011,7 @@ const RenderAdminFileManager = () => {
             <View className="flex-row items-center justify-between">
               <View className="flex-row items-center">
                 <TouchableOpacity
-                  onPress={() => setSelectedFolder(null)}
+                  onPress={() => {setSelectedFolder(null); setCurrentFolder(null)}}
                   className="mr-3 p-2"
                 >
                   <Ionicons name="chevron-back" size={24} color="#6B7280" />
@@ -1129,12 +2021,20 @@ const RenderAdminFileManager = () => {
                     {selectedFolder.name}
                   </Text>
                   <Text className="text-gray-600 mt-1">
-                    {selectedFolder.files.length} files
+                    {selectedFolder.subfolders?.length || 0} Subfolders
                   </Text>
                 </View>
               </View>
-              <TouchableOpacity
-                onPress={() => handleMultipleFileUpload(selectedFolder.id)}
+              <View className="flex-row items-center">
+                <TouchableOpacity
+                  onPress={() => setIsCreatingSubfolder(true)}
+                  className="bg-purple-500 px-3 py-2 rounded-full flex-row items-center mr-2"
+                >
+                  <Ionicons name="add" size={14} color="white" />
+                  <Text className="text-white font-medium ml-1 text-sm">Subfolder</Text>
+                </TouchableOpacity>
+                <TouchableOpacity
+                onPress={() => handleFolderUpload(selectedFolder.id)}
                 disabled={uploadingFiles.has(selectedFolder.id)}
                 className="bg-blue-500 px-4 py-2 rounded-full flex-row items-center"
               >
@@ -1147,76 +2047,298 @@ const RenderAdminFileManager = () => {
                   </>
                 )}
               </TouchableOpacity>
+              </View>
             </View>
           </View>
         </View>
 
-        {/* Files List */}
         <ScrollView className="flex-1 px-4 py-4">
-          {selectedFolder.files.length === 0 ? (
+          {/* Subfolders Section */}
+          {selectedFolder.subfolders && selectedFolder.subfolders.length > 0 && (
+            <View className="mb-6">
+              <Text className="text-lg font-semibold text-gray-800 mb-3">Subfolders</Text>
+              <View className="space-y-2">
+                {selectedFolder.subfolders.map((subfolder) => (
+                  <TouchableOpacity
+                    key={subfolder.id}
+                    onPress={() => setSelectedSubfolder(subfolder)}
+                    className="bg-white mb-3 rounded-xl shadow-sm p-4"
+                  >
+                    <View className="flex-row items-center justify-between">
+                      <View className="flex-row items-center flex-1">
+                        <View className="w-10 h-10 bg-purple-500 rounded-full items-center justify-center mr-3">
+                          <Ionicons name="folder" size={20} color="white" />
+                        </View>
+                        <View className="flex-1">
+                          <Text className="text-gray-800 font-medium">
+                            {subfolder.name}
+                          </Text>
+                          <Text className="text-gray-600 text-sm">
+                            {subfolder.files.length} files
+                          </Text>
+                          {subfolder.description && (
+                            <Text className="text-gray-500 text-sm mt-1" numberOfLines={1}>
+                              {subfolder.description}
+                            </Text>
+                          )}
+                        </View>
+                      </View>
+<View className="flex-row items-center">
+  <TouchableOpacity
+    onPress={(e) => {
+      e.stopPropagation();
+      handleEditSubfolder(subfolder);
+    }}
+    className="p-2 mr-1"
+  >
+    <Ionicons name="create-outline" size={18} color="#6B7280" />
+  </TouchableOpacity>
+  <TouchableOpacity
+    onPress={(e) => {
+      e.stopPropagation();
+      deleteSubfolder(selectedFolder.id, subfolder.id);
+    }}
+    className="p-2 mr-2"
+  >
+    <Ionicons name="trash-outline" size={18} color="#EF4444" />
+  </TouchableOpacity>
+  <Ionicons name="chevron-forward" size={18} color="#6B7280" />
+</View>                    </View>
+                  </TouchableOpacity>
+                ))}
+              </View>
+            </View>
+          )}
+
+          {/* Files Section */}
+          {selectedFolder.files.length > 0 && (
+            <View>
+              <Text className="text-lg font-semibold text-gray-800 mb-3">Files</Text>
+              <View className="space-y-2">
+                {selectedFolder.files.map((file) => (
+                  <View key={file.id} className="bg-white rounded-xl shadow-mb-2 p-4">
+                    <View className="flex-row items-center justify-between">
+                      <View className="flex-row items-center flex-1">
+                        <View className="w-10 h-10 bg-blue-100 rounded-full items-center justify-center mr-3">
+                          <Ionicons 
+                            name={getFileIcon(file.type)} 
+                            size={18} 
+                            color="#3B82F6" 
+                          />
+                        </View>
+                        <View className="flex-1">
+                          <Text className="text-gray-800 font-medium" numberOfLines={1}>
+                            {file.name}
+                          </Text>
+                          <View className="flex-row items-center mt-1">
+                            <Text className="text-gray-500 text-sm">
+                              {formatFileSize(file.size)}
+                            </Text>
+                            <Text className="text-gray-400 text-sm mx-2">•</Text>
+                            <Text className="text-gray-500 text-sm">
+                              {new Date(file.uploadedAt).toLocaleDateString()}
+                            </Text>
+                          </View>
+                        </View>
+                      </View>
+                      <View className="flex-row items-center">
+                        <TouchableOpacity
+                          onPress={() => openFile(file.url, file.name)}
+                          className="p-2 mr-2"
+                        >
+                          <Ionicons name="eye-outline" size={18} color="#6B7280" />
+                        </TouchableOpacity>
+                        <TouchableOpacity
+                          onPress={() => deleteFile(selectedFolder.id, file.id, file.name)}
+                          className="p-2"
+                        >
+                          <Ionicons name="trash-outline" size={18} color="#EF4444" />
+                        </TouchableOpacity>
+                      </View>
+                    </View>
+                  </View>
+                ))}
+              </View>
+            </View>
+          )}
+
+          {/* Empty State */}
+          {(!selectedFolder.subfolders || selectedFolder.subfolders.length === 0) && selectedFolder.files.length === 0 && (
             <View className="flex-1 items-center justify-center py-20">
               <View className="w-20 h-20 bg-gray-200 rounded-full items-center justify-center mb-4">
                 <Ionicons name="folder-open-outline" size={40} color="#9CA3AF" />
               </View>
-              <Text className="text-gray-500 text-lg font-medium">No files yet</Text>
+              <Text className="text-gray-500 text-lg font-medium">Empty folder</Text>
               <Text className="text-gray-400 text-center mt-2 px-8">
-                Upload files to this folder to get started
+                Create subfolders or upload files to get started
               </Text>
-            </View>
-          ) : (
-            <View className="space-y-3">
-              {selectedFolder.files.map((file) => (
-                <View key={file.id} className="bg-white rounded-2xl mb-1 shadow-sm p-4">
-                  <View className="flex-row items-center justify-between">
-                    <View className="flex-row items-center flex-1">
-                      <View className="w-12 h-12 bg-blue-100 rounded-full items-center justify-center mr-3">
-                        <Ionicons 
-                          name={getFileIcon(file.type)} 
-                          size={20} 
-                          color="#3B82F6" 
-                        />
-                      </View>
-                      <View className="flex-1">
-                        <Text className="text-gray-800 font-medium" numberOfLines={1}>
-                          {file.name}
-                        </Text>
-                        <View className="flex-row items-center mt-1">
-                          <Text className="text-gray-500 text-sm">
-                            {formatFileSize(file.size)}
-                          </Text>
-                          <Text className="text-gray-400 text-sm mx-2">•</Text>
-                          <Text className="text-gray-500 text-sm">
-                            {new Date(file.uploadedAt).toLocaleDateString()}
-                          </Text>
-                        </View>
-                      </View>
-                    </View>
-                    <View className="flex-row items-center">
-                      <TouchableOpacity
-                        onPress={() => openFile(file.url, file.name)}
-                        className="p-2 mr-2"
-                      >
-                        <Ionicons name="eye-outline" size={20} color="#6B7280" />
-                      </TouchableOpacity>
-<TouchableOpacity
-  onPress={() => deleteFile(selectedFolder.id, file.id, file.name)}
-  className="p-2"
->
-  <Ionicons name="trash-outline" size={20} color="#EF4444" />
-</TouchableOpacity>
-
-                    </View>
-                  </View>
-                </View>
-              ))}
             </View>
           )}
         </ScrollView>
+
+        {/* Create Subfolder Modal */}
+        <Modal
+          visible={isCreatingSubfolder}
+          transparent={true}
+          animationType="fade"
+          onRequestClose={() => setIsCreatingSubfolder(false)}
+        >
+          <TouchableOpacity 
+            className="flex-1 bg-black/50 items-center justify-center p-4"
+            activeOpacity={1}
+            onPress={() => {
+              subfolderNameRef.current?.blur();
+              subfolderDescriptionRef.current?.blur();
+              setIsCreatingSubfolder(false);
+            }}
+          >
+            <TouchableOpacity 
+              className="bg-white rounded-2xl p-6 w-full max-w-sm"
+              activeOpacity={1}
+              onPress={(e) => e.stopPropagation()}
+            >
+              <Text className="text-xl font-bold text-gray-800 mb-4">
+                Create Subfolder
+              </Text>
+              
+              <View className="mb-4">
+                <Text className="text-gray-700 font-medium mb-2">Subfolder Name</Text>
+                <TextInput
+                  ref={subfolderNameRef}
+                  defaultValue=""
+                  onChangeText={(text) => {
+                    subfolderNameRefValue.current = text;
+                  }}
+                  placeholder="Enter subfolder name"
+                  className="border border-gray-300 rounded-xl px-4 py-3 text-gray-800"
+                  returnKeyType="next"
+                  onSubmitEditing={() => {
+                    subfolderDescriptionRef.current?.focus();
+                  }}
+                />
+              </View>
+
+              <View className="mb-6">
+                <Text className="text-gray-700 font-medium mb-2">Description (Optional)</Text>
+                <TextInput
+                  ref={subfolderDescriptionRef}
+                  defaultValue=""
+                  onChangeText={(text) => {
+                    subfolderDescriptionRefValue.current = text;
+                  }}
+                  placeholder="Enter subfolder description"
+                  className="border border-gray-300 rounded-xl px-4 py-3 text-gray-800"
+                  multiline
+                  numberOfLines={3}
+                  textAlignVertical="top"
+                  returnKeyType="done"
+                  blurOnSubmit={true}
+                  onSubmitEditing={() => {
+                    subfolderDescriptionRef.current?.blur();
+                  }}
+                />
+              </View>
+
+              <View className="flex-row space-x-3">
+                <TouchableOpacity
+                  onPress={() => {
+                    subfolderNameRef.current?.blur();
+                    subfolderDescriptionRef.current?.blur();
+                    subfolderNameRefValue.current = "";
+                    subfolderDescriptionRefValue.current = "";
+                    subfolderNameRef.current?.clear();
+                    subfolderDescriptionRef.current?.clear();
+                    setIsCreatingSubfolder(false);
+                  }}
+                  className="flex-1 bg-gray-200 py-3 rounded-xl items-center"
+                >
+                  <Text className="text-gray-700 font-medium">Cancel</Text>
+                </TouchableOpacity>
+                <TouchableOpacity
+                  onPress={async () => {
+                    subfolderNameRef.current?.blur();
+                    subfolderDescriptionRef.current?.blur();
+                    console.log('Subfolder Name:', subfolderNameRefValue.current);
+                    console.log('Subfolder Description:', subfolderDescriptionRefValue.current);
+                    await new Promise((res) => setTimeout(res, 100));
+                    await createNewSubfolder(selectedFolder.id);
+                    
+                  }}
+                  className="flex-1 bg-purple-500 py-3 rounded-xl items-center ml-3"
+                >
+                  <Text className="text-white font-medium">Create</Text>
+                </TouchableOpacity>
+              </View>
+            </TouchableOpacity>
+          </TouchableOpacity>
+        </Modal>
+        {/* Edit Subfolder Modal */}
+<Modal
+  visible={isEditingSubfolder}
+  transparent={true}
+  animationType="fade"
+  onRequestClose={() => setIsEditingSubfolder(false)}
+>
+  <TouchableOpacity 
+    className="flex-1 bg-black/50 items-center justify-center p-4"
+    activeOpacity={1}
+    onPress={() => {
+      editSubfolderNameRef.current?.blur();
+      setIsEditingSubfolder(false);
+      setEditingSubfolder(null);
+      setEditSubfolderName('');
+    }}
+  >
+    <TouchableOpacity 
+      className="bg-white rounded-2xl p-6 w-full max-w-sm"
+      activeOpacity={1}
+      onPress={(e) => e.stopPropagation()}
+    >
+      <Text className="text-xl font-bold text-gray-800 mb-4">
+        Edit Subfolder Name
+      </Text>
+      
+      <View className="mb-6">
+        <Text className="text-gray-700 font-medium mb-2">Subfolder Name</Text>
+        <TextInput
+          ref={editSubfolderNameRef}
+          value={editSubfolderName}
+          onChangeText={(text: string) => setEditSubfolderName(text)}
+          placeholder="Enter subfolder name"
+          className="border border-gray-300 rounded-xl px-4 py-3 text-gray-800"
+          returnKeyType="done"
+          onSubmitEditing={handleSaveSubfolderEdit}
+          selectTextOnFocus={true}
+        />
+      </View>
+
+      <View className="flex-row space-x-3">
+        <TouchableOpacity
+          onPress={() => {
+            editSubfolderNameRef.current?.blur();
+            setIsEditingSubfolder(false);
+            setEditingSubfolder(null);
+            setEditSubfolderName('');
+          }}
+          className="flex-1 bg-gray-200 py-3 rounded-xl items-center"
+        >
+          <Text className="text-gray-700 font-medium">Cancel</Text>
+        </TouchableOpacity>
+        <TouchableOpacity
+          onPress={handleSaveSubfolderEdit}
+          className="flex-1 bg-purple-500 py-3 rounded-xl items-center ml-3"
+        >
+          <Text className="text-white font-medium">Save</Text>
+        </TouchableOpacity>
+      </View>
+    </TouchableOpacity>
+  </TouchableOpacity>
+</Modal>
       </SafeAreaView>
     );
   }
 
-  // Folder List View
+  // Main Folder List View
   return (
     <SafeAreaView className="flex-1 bg-gray-50">
       {/* Header */}
@@ -1267,8 +2389,8 @@ const RenderAdminFileManager = () => {
             {adminFiles.map((folder) => (
               <TouchableOpacity
                 key={folder.id}
-                onPress={() => setSelectedFolder(folder)}
-                className="bg-white rounded-2xl shadow-sm p-6"
+                onPress={() => {setSelectedFolder(folder); setCurrentFolder(folder)}}
+                className="bg-white rounded-2xl mb-2 shadow-sm p-6"
               >
                 <View className="flex-row items-center justify-between">
                   <View className="flex-row items-center flex-1">
@@ -1280,7 +2402,7 @@ const RenderAdminFileManager = () => {
                         {folder.name}
                       </Text>
                       <Text className="text-gray-600 text-sm mt-1">
-                        {folder.files.length} files
+                        {folder.subfolders?.length || 0} Subfolders 
                       </Text>
                       {folder.description && (
                         <Text className="text-gray-500 text-sm mt-1" numberOfLines={2}>
@@ -1289,19 +2411,28 @@ const RenderAdminFileManager = () => {
                       )}
                     </View>
                   </View>
-                  <View className="flex-row items-center">
-                    <TouchableOpacity
-                      onPress={async (e) => {
-                        e.stopPropagation();
-                        await deleteFolder(folder.id);
-                      }}
-                      className="p-2 ml-2"
-                    >
-                      <Ionicons name="trash-outline" size={20} color="#EF4444" />
-                    </TouchableOpacity>
-                    <Ionicons name="chevron-forward" size={20} color="#6B7280" />
-                  </View>
-                </View>
+<View className="flex-row items-center">
+  <TouchableOpacity
+    onPress={(e) => {
+      e.stopPropagation();
+      handleEditFolder(folder);
+    }}
+    className="p-2 ml-2"
+  >
+    <Ionicons name="create-outline" size={20} color="#6B7280" />
+  </TouchableOpacity>
+  <TouchableOpacity
+    onPress={async (e) => {
+      e.stopPropagation();
+      await deleteFolder(folder.id);
+    }}
+    className="p-2 ml-1"
+  >
+    <Ionicons name="trash-outline" size={20} color="#EF4444" />
+  </TouchableOpacity>
+  <Ionicons name="chevron-forward" size={20} color="#6B7280" />
+</View>                
+</View>
               </TouchableOpacity>
             ))}
           </View>
@@ -1399,10 +2530,71 @@ const RenderAdminFileManager = () => {
           </TouchableOpacity>
         </TouchableOpacity>
       </Modal>
+      {/* Edit Folder Modal */}
+<Modal
+  visible={isEditingFolder}
+  transparent={true}
+  animationType="fade"
+  onRequestClose={() => setIsEditingFolder(false)}
+>
+  <TouchableOpacity 
+    className="flex-1 bg-black/50 items-center justify-center p-4"
+    activeOpacity={1}
+    onPress={() => {
+      editFolderNameRef.current?.blur();
+      setIsEditingFolder(false);
+      setEditingFolder(null);
+      setEditFolderName('');
+    }}
+  >
+    <TouchableOpacity 
+      className="bg-white rounded-2xl p-6 w-full max-w-sm"
+      activeOpacity={1}
+      onPress={(e) => e.stopPropagation()}
+    >
+      <Text className="text-xl font-bold text-gray-800 mb-4">
+        Edit Folder Name
+      </Text>
+      
+      <View className="mb-6">
+        <Text className="text-gray-700 font-medium mb-2">Folder Name</Text>
+        <TextInput
+          ref={editFolderNameRef}
+          value={editFolderName}
+          onChangeText={(text: string) => setEditFolderName(text)}
+          placeholder="Enter folder name"
+          className="border border-gray-300 rounded-xl px-4 py-3 text-gray-800"
+          returnKeyType="done"
+          onSubmitEditing={handleSaveEdit}
+          selectTextOnFocus={true}
+        />
+      </View>
+
+      <View className="flex-row space-x-3">
+        <TouchableOpacity
+          onPress={() => {
+            editFolderNameRef.current?.blur();
+            setIsEditingFolder(false);
+            setEditingFolder(null);
+            setEditFolderName('');
+          }}
+          className="flex-1 bg-gray-200 py-3 rounded-xl items-center"
+        >
+          <Text className="text-gray-700 font-medium">Cancel</Text>
+        </TouchableOpacity>
+        <TouchableOpacity
+          onPress={handleSaveEdit}
+          className="flex-1 bg-blue-500 py-3 rounded-xl items-center ml-3"
+        >
+          <Text className="text-white font-medium">Save</Text>
+        </TouchableOpacity>
+      </View>
+    </TouchableOpacity>
+  </TouchableOpacity>
+</Modal>
     </SafeAreaView>
   );
 };
-
 
 
 const loadStudentData = async (userId: string) => {
@@ -1456,22 +2648,36 @@ const loadInstructorData = async (userId: string) => {
   }
 };
   // دالة لجلب الفولدرات من Supabase
-  const fetchFolders = async () => {
-    const { data, error } = await supabase
+const fetchFolders = async () => {
+  try {
+    // Fetch folders
+    const { data: folders, error: foldersError } = await supabase
       .from("folders")
       .select("*")
       .order("created_at", { ascending: false });
 
-    if (error) {
-      Alert.alert("Error", "Failed to fetch folders: " + error.message);
-      return;
-    }
+    if (foldersError) throw foldersError;
 
-    if (data) {
-      setAdminFiles(data);
-      console.log("📂 fetched folders data:", data);
-    }
-  };
+    // Fetch subfolders
+    const { data: subfolders, error: subfoldersError } = await supabase
+      .from("subfolders")
+      .select("*")
+      .order("created_at", { ascending: false });
+
+    if (subfoldersError) throw subfoldersError;
+
+    // Combine folders with their subfolders
+    const foldersWithSubfolders = folders?.map(folder => ({
+      ...folder,
+      subfolders: subfolders?.filter(sf => sf.parent_folder_id === folder.id) || []
+    })) || [];
+
+    setAdminFiles(foldersWithSubfolders);
+  } catch (error) {
+    console.error("Error fetching folders:", error);
+  }
+};
+
 
   // جلب الفولدرات مرة واحدة عند تحميل المكون
   useEffect(() => {
@@ -2482,23 +3688,433 @@ return (
     );
   };
 
-  // 5. Enhanced DashboardScreen with staggered animations
+// TypeScript interfaces from your provided types
+interface FileItem {
+  id: string;
+  name: string;
+  url: string;
+  size: number;
+  type: string;
+  uploadedAt: string;
+  uploadedBy: string;
+}
+
+interface SubfolderItem {
+  id: string;
+  name: string;
+  description?: string;
+  files: FileItem[];
+  created_at: string;
+  parent_folder_id: string;
+}
+
+interface FolderItem {
+  id: string;
+  name: string;
+  description?: string;
+  files: FileItem[];
+  subfolders: SubfolderItem[];
+  created_at: string;
+}
+
+interface Student {
+  id: string;
+  name: string;
+  student_email: string;
+  father_email: string;
+  user_id: string;
+  mother_email: string;
+  online_instructor_name: string;
+  online_instructor_id: string;
+  theory_instructor_name: string;
+  theory_instructor_id: string;
+  in_person_name: string;
+  in_person_id: string;
+  created_at: string;
+  instrument: string;
+  avatar: string;
+  color: string;
+}
+
+interface StudentProfile {
+  id: string;
+  name: string;
+  instrument: string;
+  avatar: string;
+  color: string;
+  instructor_name?: string;
+}
+
+interface SessionTypeConfig {
+  color: string;
+  icon: string;
+  bgColor: string;
+}
+
+interface StudentSession {
+  id: string;
+  instructor_name: string;
+  student_id: string;
+  session_type: "in_person" | "online_instrument" | "theory";
+  session_number: number;
+  total_sessions: number;
+  completed: boolean;
+  instructor_id: string;
+  feedback?: string;
+  comment: number;
+  homework_rating?: number;
+  sheet?: string;
+  HW_comments?: string;
+  sheet_url?: string;
+  created_at: string;
+}
+
 const DashboardScreen: React.FC = () => {
   const navigation = useNavigation();
-  const [searchQuery, setSearchQuery] = useState('');
+  const [searchQuery, setSearchQuery] = useState<string>('');
   const [sessionAnims] = useState(
     todaySessions.map(() => new Animated.Value(0))
   );
+  
+  // File-related state with proper TypeScript types
+  const [subfolders, setSubfolders] = useState<SubfolderItem[]>([]);
+  const [folders, setFolders] = useState<FolderItem[]>([]);
+  const [loading, setLoading] = useState<boolean>(false);
+  const [selectedFile, setSelectedFile] = useState<FileItem | null>(null);
+  const [showFileSelector, setShowFileSelector] = useState<boolean>(false);
+  const [fileSearchQuery, setFileSearchQuery] = useState<string>('');
+  const [expandedFolders, setExpandedFolders] = useState<Set<string>>(new Set());
+  const [expandedSubfolders, setExpandedSubfolders] = useState<Set<string>>(new Set());
 
   useLayoutEffect(() => {
     navigation.setOptions({ headerShown: false });
   }, [navigation]);
+const toggleSubfolder = (subfolderId: string): void => {
+  const newExpanded = new Set(expandedSubfolders);
+  if (newExpanded.has(subfolderId)) {
+    newExpanded.delete(subfolderId);
+  } else {
+    newExpanded.add(subfolderId);
+  }
+  setExpandedSubfolders(newExpanded);
+};
 
   // Filter students based on search query
-  const filteredSessions = todaySessions.filter(student =>
+  const filteredSessions: Student[] = todaySessions.filter((student: Student) =>
     student.name.toLowerCase().includes(searchQuery.toLowerCase())
   );
 
+  // Fetch files from folders and subfolders tables
+// 1. Update the fetchFiles function (around line 35-70)
+// 1. Update the fetchFiles function (around line 35-70)
+const fetchFiles = async (): Promise<void> => {
+  try {
+    setLoading(true);
+    
+    // Fetch both folders and subfolders
+    const [foldersResult, subfoldersResult] = await Promise.all([
+      supabase.from('folders').select('*'),
+      supabase.from('subfolders').select('*')
+    ]);
+
+    if (foldersResult.error) {
+      console.error('Error fetching folders:', foldersResult.error);
+      Alert.alert('Error', 'Failed to load folders');
+      return;
+    }
+
+    if (subfoldersResult.error) {
+      console.error('Error fetching subfolders:', subfoldersResult.error);
+      Alert.alert('Error', 'Failed to load subfolders');
+      return;
+    }
+
+    // Process subfolders
+    const processedSubfolders: SubfolderItem[] = subfoldersResult.data?.map((subfolder: any) => ({
+      id: subfolder.id,
+      name: subfolder.name,
+      description: subfolder.description,
+      files: subfolder.files && Array.isArray(subfolder.files) ? subfolder.files.sort((a: FileItem, b: FileItem) => 
+        new Date(b.uploadedAt).getTime() - new Date(a.uploadedAt).getTime()
+      ) : [],
+      created_at: subfolder.created_at,
+      parent_folder_id: subfolder.parent_folder_id
+    })) || [];
+
+    // Process folders and group subfolders
+    const processedFolders: FolderItem[] = foldersResult.data?.map((folder: any) => {
+      const folderSubfolders = processedSubfolders.filter(
+        subfolder => subfolder.parent_folder_id === folder.id
+      );
+
+      return {
+        id: folder.id,
+        name: folder.name,
+        description: folder.description,
+        files: folder.files && Array.isArray(folder.files) ? folder.files.sort((a: FileItem, b: FileItem) => 
+          new Date(b.uploadedAt).getTime() - new Date(a.uploadedAt).getTime()
+        ) : [],
+        subfolders: folderSubfolders.sort((a: SubfolderItem, b: SubfolderItem) => 
+          a.name?.localeCompare(b.name) || 0
+        ),
+        created_at: folder.created_at
+      };
+    }) || [];
+
+    // Sort folders alphabetically
+    processedFolders.sort((a: FolderItem, b: FolderItem) => 
+      a.name?.localeCompare(b.name) || 0
+    );
+
+    setFolders(processedFolders);
+    // Keep subfolders for backward compatibility if needed
+    setSubfolders(processedSubfolders);
+  } catch (error) {
+    console.error('Error fetching files:', error);
+    Alert.alert('Error', 'Failed to load files');
+  } finally {
+    setLoading(false);
+  }
+};
+
+  // Load files when component mounts
+  useEffect(() => {
+    fetchFiles();
+  }, []);
+// Add this function after the other file handling functions (around line 170)
+const sendFileToStudents = async (file: FileItem): Promise<void> => {
+  try {
+    Alert.alert(
+      "Send File to Students",
+      `Are you sure you want to send "${file.name}" to all students?`,
+      [
+        {
+          text: "Cancel",
+          style: "cancel"
+        },
+        {
+          text: "Send",
+          onPress: async () => {
+            try {
+              const { data, error } = await supabase
+                .from('filesToStudent')
+                .insert([
+                  {
+                    files: [file] // Send as JSONB array
+                  }
+                ]);
+
+              if (error) {
+                console.error('Error sending file:', error);
+                Alert.alert('Error', 'Failed to send file to students');
+                return;
+              }
+
+              Alert.alert('Success', `File "${file.name}" has been sent to all students`);
+            } catch (error) {
+              console.error('Error sending file:', error);
+              Alert.alert('Error', 'Failed to send file to students');
+            }
+          }
+        }
+      ]
+    );
+  } catch (error) {
+    console.error('Error in sendFileToStudents:', error);
+    Alert.alert('Error', 'Something went wrong');
+  }
+};
+
+// 2. Update the filtering logic (replace the existing filteredSubfolders)
+const filteredFolders: FolderItem[] = folders.map((folder: FolderItem) => {
+  if (!fileSearchQuery) return folder;
+  
+  // Filter subfolders and their files
+  const matchingSubfolders: SubfolderItem[] = folder.subfolders.map((subfolder: SubfolderItem) => {
+    const matchingFiles: FileItem[] = subfolder.files?.filter((file: FileItem) =>
+      file.name.toLowerCase().includes(fileSearchQuery.toLowerCase())
+    ) || [];
+    
+    const subfolderMatches: boolean = subfolder.name?.toLowerCase().includes(fileSearchQuery.toLowerCase());
+    
+    if (subfolderMatches || matchingFiles.length > 0) {
+      return {
+        ...subfolder,
+        files: subfolderMatches ? subfolder.files : matchingFiles
+      };
+    }
+    return null;
+  }).filter((subfolder): subfolder is SubfolderItem => subfolder !== null);
+
+  // Filter folder's direct files
+  const matchingFolderFiles: FileItem[] = folder.files?.filter((file: FileItem) =>
+    file.name.toLowerCase().includes(fileSearchQuery.toLowerCase())
+  ) || [];
+  
+  const folderMatches: boolean = folder.name?.toLowerCase().includes(fileSearchQuery.toLowerCase());
+  
+  if (folderMatches || matchingSubfolders.length > 0 || matchingFolderFiles.length > 0) {
+    return {
+      ...folder,
+      files: folderMatches ? folder.files : matchingFolderFiles,
+      subfolders: matchingSubfolders
+    };
+  }
+  return null;
+}).filter((folder): folder is FolderItem => folder !== null);
+
+// 3. Update the toggle functions
+const toggleFolder = (folderId: string): void => {
+  const newExpanded = new Set(expandedFolders);
+  if (newExpanded.has(folderId)) {
+    newExpanded.delete(folderId);
+  } else {
+    newExpanded.add(folderId);
+  }
+  setExpandedFolders(newExpanded);
+};
+
+// 4. Update the count functions
+// 4. Update the count functions
+const getTotalFileCount = (): number => {
+  return folders.reduce((total: number, folder: FolderItem) => {
+    const folderFiles = folder.files?.length || 0;
+    const subfolderFiles = folder.subfolders.reduce((subTotal: number, subfolder: SubfolderItem) => 
+      subTotal + (subfolder.files?.length || 0), 0
+    );
+    return total + folderFiles + subfolderFiles;
+  }, 0);
+};
+
+const getTotalFolderCount = (): number => {
+  const folderCount = folders.length;
+  const subfolderCount = folders.reduce((total: number, folder: FolderItem) => 
+    total + folder.subfolders.length, 0
+  );
+  return folderCount + subfolderCount;
+};
+
+  // File opening functions with proper TypeScript
+  const openFile = async (url: string, name: string): Promise<void> => {
+    try {
+      console.log('Attempting to open file:', { url, name });
+      
+      if (name.toLowerCase().endsWith('.pdf')) {
+        await openFileExternal(url, name);
+      } else {
+        await openFileExternal(url, name);
+      }
+    } catch (error) {
+      console.error('Error opening file:', error);
+      Alert.alert("Error", "Failed to open file");
+    }
+  };
+
+  const openFileExternal = async (url: string, name: string): Promise<void> => {
+    try {
+      let cleanUrl: string = url.trim();
+      
+      if (!cleanUrl.startsWith('http://') && !cleanUrl.startsWith('https://')) {
+        cleanUrl = `https://${cleanUrl}`;
+      }
+      
+      console.log('Opening URL:', cleanUrl);
+      
+      const supported: boolean = await Linking.canOpenURL(cleanUrl);
+      if (supported) {
+        await Linking.openURL(cleanUrl);
+        return;
+      }
+      
+      try {
+        const decodedUrl: string = decodeURIComponent(cleanUrl);
+        const decodedSupported: boolean = await Linking.canOpenURL(decodedUrl);
+        if (decodedSupported) {
+          await Linking.openURL(decodedUrl);
+          return;
+        }
+      } catch (decodeError) {
+        console.log('URL decode failed, trying original');
+      }
+      
+      await downloadAndOpenFile(cleanUrl, name);
+      
+    } catch (error) {
+      console.error('Linking error:', error);
+      Alert.alert("Error", "Failed to open file. Please check your internet connection.");
+    }
+  };
+
+  const downloadAndOpenFile = async (url: string, fileName: string): Promise<void> => {
+    try {
+      const downloadDir: string = FileSystem.cacheDirectory!;
+      const fileUri: string = `${downloadDir}${fileName}`;
+      
+      console.log('Downloading file to:', fileUri);
+      
+      const downloadResult = await FileSystem.downloadAsync(url, fileUri);
+      
+      if (downloadResult.status === 200) {
+        const canOpen: boolean = await Linking.canOpenURL(downloadResult.uri);
+        if (canOpen) {
+          await Linking.openURL(downloadResult.uri);
+        } else {
+          const fileUrl: string = `file://${downloadResult.uri}`;
+          const canOpenFile: boolean = await Linking.canOpenURL(fileUrl);
+          if (canOpenFile) {
+            await Linking.openURL(fileUrl);
+          } else {
+            Alert.alert(
+              "File Downloaded", 
+              `File saved to cache but cannot be opened automatically. You can find it in your device's file manager.`
+            );
+          }
+        }
+      } else {
+        throw new Error(`Download failed with status: ${downloadResult.status}`);
+      }
+    } catch (error) {
+      console.error('Download error:', error);
+      Alert.alert("Error", "Unable to download file. Please check the file URL and your internet connection.");
+    }
+  };
+
+  const handleFileSelect = (file: FileItem): void => {
+    setSelectedFile(file);
+    setShowFileSelector(false);
+  };
+
+const getFileIcon = (fileName: string): keyof typeof Ionicons.glyphMap => {
+    const extension: string | undefined = fileName.toLowerCase().split('.').pop();
+    switch (extension) {
+      case 'pdf':
+        return 'document-text-outline';
+      case 'jpg':
+      case 'jpeg':
+      case 'png':
+      case 'gif':
+        return 'image-outline';
+      case 'mp3':
+      case 'wav':
+      case 'aac':
+        return 'musical-notes-outline';
+      case 'mp4':
+      case 'mov':
+      case 'avi':
+        return 'videocam-outline';
+      default:
+        return 'document-outline';
+    }
+  };
+
+  const getFolderIcon = (folderName: string): keyof typeof Ionicons.glyphMap => {
+    const name: string = folderName?.toLowerCase() || '';
+    if (name.includes('video')) return 'videocam';
+    if (name.includes('audio') || name.includes('music')) return 'musical-notes';
+    if (name.includes('image') || name.includes('photo')) return 'image';
+    if (name.includes('document') || name.includes('pdf')) return 'document-text';
+    return 'folder';
+  };
   return (
     <SafeAreaView className="flex-1 bg-gray-50">
       <StatusBar barStyle="dark-content" backgroundColor="#F9FAFB" />
@@ -2524,7 +4140,7 @@ const DashboardScreen: React.FC = () => {
           </View>
 
           {/* Search Bar */}
-          <View className="flex-row items-center bg-gray-100 rounded-xl px-4 py-3">
+          <View className="flex-row items-center bg-gray-100 rounded-xl px-4 py-3 mb-4">
             <Ionicons name="search" size={20} color="#6B7280" />
             <TextInput
               placeholder="Search students by name..."
@@ -2542,26 +4158,353 @@ const DashboardScreen: React.FC = () => {
               </TouchableOpacity>
             )}
           </View>
+
+          {/* Enhanced File Selector */}
+          <TouchableOpacity
+            onPress={() => setShowFileSelector(true)}
+            className="flex-row items-center justify-between bg-white rounded-xl shadow-sm border border-gray-100 px-4 py-3 mb-4"
+          >
+            <View className="flex-row items-center flex-1">
+              <View className="w-10 h-10 bg-gradient-to-br from-blue-500 to-purple-600 rounded-xl items-center justify-center mr-3">
+                <Text style={{fontSize: 22}}>
+                📁
+                </Text>
+              </View>
+              <View className="flex-1">
+                <Text className="text-gray-900 font-semibold text-base">
+                  {selectedFile ? selectedFile.name : 'Select Course Material'}
+                </Text>
+                <Text className="text-gray-500 text-sm">
+                  {selectedFile 
+                    ? 'Tap to change selection' 
+                    : `${getTotalFileCount()} files in ${getTotalFolderCount()} folders`
+                  }
+                </Text>
+              </View>
+            </View>
+            
+            <View className="flex-row items-center space-x-2">
+              {selectedFile && (
+                <TouchableOpacity
+                  onPress={(e) => {
+                    e.stopPropagation();
+                    openFile(selectedFile.url, selectedFile.name);
+                  }}
+                  className="w-8 h-8 bg-green-500 rounded-lg items-center justify-center ms-1 me-1"
+                >
+                  <Ionicons name="open-outline" size={16} color="white" />
+                </TouchableOpacity>
+              )}
+              <Ionicons name="chevron-down" size={18} color="#6B7280" />
+            </View>
+          </TouchableOpacity>
+
+          {/* Enhanced Bottom Sheet Modal */}
+          <Modal
+            visible={showFileSelector}
+            transparent={true}
+            animationType="slide"
+            onRequestClose={() => setShowFileSelector(false)}
+          >
+            <View className="flex-1 justify-end bg-black/50">
+              <View className="bg-white rounded-t-3xl max-h-[85%] min-h-[60%]">
+                {/* Modal Header */}
+                <View className="px-6 pt-6 pb-4 border-b border-gray-100">
+                  <View className="flex-row items-center justify-between mb-4">
+                    <View>
+                      <Text className="text-xl font-bold text-gray-900">Course Materials</Text>
+                      <Text className="text-gray-500 text-sm">
+                        {getTotalFileCount()} files in {getTotalFolderCount()} folders
+                      </Text>
+                    </View>
+                    <View className="flex-row items-center space-x-3">
+                      <TouchableOpacity
+                        onPress={() => fetchFiles()}
+                        disabled={loading}
+                        className="w-10 h-10 bg-blue-50 rounded-xl items-center justify-center ms-2 me-2"
+                      >
+                        <Ionicons name="refresh" size={20} color="#3B82F6" />
+                      </TouchableOpacity>
+                      <TouchableOpacity
+                        onPress={() => setShowFileSelector(false)}
+                        className="w-10 h-10 bg-gray-100 rounded-xl items-center justify-center"
+                      >
+                        <Ionicons name="close" size={20} color="#6B7280" />
+                      </TouchableOpacity>
+                    </View>
+                  </View>
+
+                  {/* Search Bar in Modal */}
+                  <View className="flex-row items-center bg-gray-100 rounded-xl px-4 py-3">
+                    <Ionicons name="search" size={18} color="#6B7280" />
+                    <TextInput
+                      placeholder="Search files and folders..."
+                      value={fileSearchQuery}
+                      onChangeText={setFileSearchQuery}
+                      className="flex-1 ml-3 text-gray-800"
+                      placeholderTextColor="#9CA3AF"
+                    />
+                    {fileSearchQuery.length > 0 && (
+                      <TouchableOpacity
+                        onPress={() => setFileSearchQuery('')}
+                        className="ml-2"
+                      >
+                        <Ionicons name="close-circle" size={18} color="#6B7280" />
+                      </TouchableOpacity>
+                    )}
+                  </View>
+                </View>
+
+{/* File List with Grouped Folders and Subfolders */}
+<ScrollView className="flex-1 px-4 py-2" showsVerticalScrollIndicator={false}>
+  {loading ? (
+    <View className="flex-1 items-center justify-center py-20">
+      <View className="w-12 h-12 border-3 border-blue-200 border-t-blue-500 rounded-full animate-spin mb-4" />
+      <Text className="text-gray-500 font-medium">Loading files...</Text>
+    </View>
+  ) : filteredFolders.length > 0 ? (
+    <View className="space-y-4 pb-6">
+      {/* Folders */}
+      {filteredFolders.map((folder: FolderItem, folderIndex: number) => (
+        <View key={folder.id || folderIndex} className="bg-gradient-to-r from-purple-50 to-blue-50 rounded-2xl overflow-hidden border border-purple-100">
+          {/* Folder Header */}
+          <TouchableOpacity
+            onPress={() => toggleFolder(folder.id)}
+            className="flex-row items-center justify-between p-4 bg-white/90 backdrop-blur-sm border-b border-purple-100"
+          >
+            <View className="flex-row items-center flex-1">
+              <View className="w-12 h-12 bg-white rounded-xl items-center justify-center mr-3 shadow-sm border border-gray-100">
+                <Ionicons 
+                  name={getFolderIcon(folder.name)} 
+                  size={22} 
+                  color="#8B5CF6" 
+                />
+              </View>
+              <View className="flex-1">
+                <Text className="font-bold text-gray-900 text-base">
+                   {folder.name || 'Main Folder'}
+                </Text>
+                <Text className="text-sm text-purple-600">
+                  {(folder.files?.length || 0) + folder.subfolders.reduce((total, sub) => total + (sub.files?.length || 0), 0)} files • {folder.subfolders.length} subfolders
+                </Text>
+                {folder.description && (
+                  <Text className="text-xs text-gray-500 mt-1">{folder.description}</Text>
+                )}
+              </View>
+            </View>
+            <Ionicons 
+              name={expandedFolders.has(folder.id) ? "chevron-up" : "chevron-down"} 
+              size={20} 
+              color="#8B5CF6" 
+            />
+          </TouchableOpacity>
+
+          {/* Folder Contents */}
+          {expandedFolders.has(folder.id) && (
+            <View className="px-2 pb-2">
+              {/* Direct Files in Folder */}
+              {folder.files && folder.files.length > 0 && (
+                <View className="mb-3">
+                  <Text className="text-xs font-semibold text-gray-600 uppercase tracking-wide px-2 py-1">
+                    Files in {folder.name}
+                  </Text>
+                  {folder.files.map((file: FileItem, fileIndex: number) => (
+                    <TouchableOpacity
+                      key={`folder-file-${file.id}-${fileIndex}`}
+                      onPress={() => handleFileSelect(file)}
+                      className={`flex-row items-center p-3 mx-2 mb-2 rounded-xl border-2 ${
+                        selectedFile?.id === file.id 
+                          ? 'bg-purple-50 border-purple-200' 
+                          : 'bg-white border-gray-100'
+                      }`}
+                    >
+                      <View className={`w-10 h-10 rounded-lg items-center justify-center mr-3 ${
+                        selectedFile?.id === file.id ? 'bg-purple-100 border border-purple-200' : 'bg-white border border-gray-100'
+                      }`}>
+                        <Ionicons 
+                          name={getFileIcon(file.name)} 
+                          size={20} 
+                          color={selectedFile?.id === file.id ? "#8B5CF6" : "#6B7280"}
+                        />
+                      </View>
+                      
+                      <View className="flex-1">
+                        <Text className={`font-medium text-sm ${
+                          selectedFile?.id === file.id ? 'text-purple-900' : 'text-gray-900'
+                        }`} numberOfLines={2}>
+                          {file.name}
+                        </Text>
+                        <Text className={`text-xs mt-1 ${
+                          selectedFile?.id === file.id ? 'text-purple-600' : 'text-gray-500'
+                        }`}>
+                          {new Date(file.uploadedAt).toLocaleDateString()}
+                          {file.uploadedBy && ` • ${file.uploadedBy}`}
+                        </Text>
+                      </View>
+                      
+                      <View className="flex-row items-center space-x-1">
+                        {selectedFile?.id === file.id && (
+                          <View className="w-6 h-6 bg-purple-500 rounded-full items-center justify-center me-1">
+                            <Ionicons name="checkmark" size={12} color="white" />
+                          </View>
+                        )}
+                        
+                        <TouchableOpacity
+                          onPress={(e) => {
+                            e.stopPropagation();
+                            openFile(file.url, file.name);
+                          }}
+                          className="w-8 h-8 bg-green-500 rounded-lg items-center justify-center"
+                        >
+                          <Ionicons name="open-outline" size={14} color="white" />
+                        </TouchableOpacity>
+                      </View>
+                    </TouchableOpacity>
+                  ))}
+                </View>
+              )}
+
+              {/* Subfolders */}
+              {folder.subfolders.map((subfolder: SubfolderItem, subfolderIndex: number) => (
+                <View key={subfolder.id || subfolderIndex} className="mb-3 bg-gradient-to-r from-blue-50 to-indigo-50 rounded-xl border border-blue-100">
+                  {/* Subfolder Header */}
+                  <TouchableOpacity
+                    onPress={() => toggleSubfolder(subfolder.id)}
+                    className="flex-row items-center justify-between p-3 bg-white/80 backdrop-blur-sm border-b border-blue-100 rounded-t-xl"
+                  >
+                    <View className="flex-row items-center flex-1">
+                      <View className="w-10 h-10 bg-white rounded-lg items-center justify-center mr-3 shadow-sm border border-gray-100">
+                        <Ionicons 
+                          name={getFolderIcon(subfolder.name)} 
+                          size={18} 
+                          color="#3B82F6" 
+                        />
+                      </View>
+                      <View className="flex-1">
+                        <Text className="font-semibold text-gray-900 text-sm">
+                           {subfolder.name || 'Subfolder'}
+                        </Text>
+                        <Text className="text-xs text-blue-600">
+                          {subfolder.files?.length || 0} files
+                        </Text>
+                      </View>
+                    </View>
+                    <Ionicons 
+                      name={expandedSubfolders.has(subfolder.id) ? "chevron-up" : "chevron-down"} 
+                      size={16} 
+                      color="#3B82F6" 
+                    />
+                  </TouchableOpacity>
+
+                  {/* Files in Subfolder */}
+                  {expandedSubfolders.has(subfolder.id) && subfolder.files && (
+                    <View className="px-2 pb-2">
+                      {subfolder.files.map((file: FileItem, fileIndex: number) => (
+                        <TouchableOpacity
+                          key={`subfolder-file-${file.id}-${fileIndex}`}
+                          onPress={() => handleFileSelect(file)}
+                          className={`flex-row items-center p-2 mx-1 mb-1 rounded-lg border ${
+                            selectedFile?.id === file.id 
+                              ? 'bg-blue-50 border-blue-200' 
+                              : 'bg-white border-gray-100'
+                          }`}
+                        >
+                          <View className={`w-8 h-8 rounded-md items-center justify-center mr-2 ${
+                            selectedFile?.id === file.id ? 'bg-blue-100 border border-blue-200' : 'bg-white border border-gray-100'
+                          }`}>
+                            <Ionicons 
+                              name={getFileIcon(file.name)} 
+                              size={16} 
+                              color={selectedFile?.id === file.id ? "#3B82F6" : "#6B7280"}
+                            />
+                          </View>
+                          
+                          <View className="flex-1">
+                            <Text className={`font-medium text-xs ${
+                              selectedFile?.id === file.id ? 'text-blue-900' : 'text-gray-900'
+                            }`} numberOfLines={1}>
+                              {file.name}
+                            </Text>
+                            <Text className={`text-xs ${
+                              selectedFile?.id === file.id ? 'text-blue-600' : 'text-gray-500'
+                            }`}>
+                              {new Date(file.uploadedAt).toLocaleDateString()}
+                            </Text>
+                          </View>
+                          
+                          <View className="flex-row items-center space-x-1">
+                            {selectedFile?.id === file.id && (
+                              <View className="w-5 h-5 bg-blue-500 rounded-full items-center justify-center me-1">
+                                <Ionicons name="checkmark" size={10} color="white" />
+                              </View>
+                            )}
+                            
+                            <TouchableOpacity
+                              onPress={(e) => {
+                                e.stopPropagation();
+                                openFile(file.url, file.name);
+                              }}
+                              className="w-6 h-6 bg-green-500 rounded-md items-center justify-center"
+                            >
+                              <Ionicons name="open-outline" size={12} color="white" />
+                            </TouchableOpacity>
+                          </View>
+                        </TouchableOpacity>
+                      ))}
+                    </View>
+                  )}
+                </View>
+              ))}
+            </View>
+          )}
+        </View>
+      ))}
+    </View>
+  ) : (
+    <View className="flex-1 items-center justify-center py-20">
+      <View className="w-20 h-20 bg-gradient-to-br from-gray-100 to-gray-200 rounded-full items-center justify-center mb-6 shadow-sm">
+        <Ionicons name="folder-open-outline" size={40} color="#9CA3AF" />
+      </View>
+      <Text className="text-gray-500 font-semibold text-lg mb-2">
+        {fileSearchQuery ? 'No matching files found' : 'No files found'}
+      </Text>
+      <Text className="text-gray-400 text-sm text-center px-8">
+        {fileSearchQuery 
+          ? `No files or folders match "${fileSearchQuery}". Try a different search term.`
+          : 'Upload some course materials to get started. Files will be organized by folders and subfolders.'
+        }
+      </Text>
+      {fileSearchQuery && (
+        <TouchableOpacity
+          onPress={() => setFileSearchQuery('')}
+          className="mt-4 bg-blue-500 px-6 py-2 rounded-xl"
+        >
+          <Text className="text-white font-medium">Clear Search</Text>
+        </TouchableOpacity>
+      )}
+    </View>
+  )}
+</ScrollView>
+              </View>
+            </View>
+          </Modal>
         </View>
       </View>
 
-      {/* Sessions List */}
+      {/* Sessions List - keeping original structure */}
       <ScrollView className="flex-1 px-4 py-4">
         <View className="space-y-3">
           {filteredSessions.length > 0 ? (
-            filteredSessions.map((student, index) => (
+            filteredSessions.map((student: Student, index: number) => (
               <View key={student.id} className="mb-4">
                 <View className="bg-white rounded-2xl shadow-sm border border-gray-100 overflow-hidden">
-                  {/* Main Card Content */}
                   <TouchableOpacity
                     onPress={() => handleInstructorStudentPress(student)}
                     className="active:opacity-70"
                     activeOpacity={0.95}
                   >
                     <View className="p-4">
-                      {/* Header Row */}
                       <View className="flex-row items-center space-x-4">
-                        {/* Enhanced Avatar */}
                         <View className="relative">
                           <View
                             className="w-14 h-14 rounded-full items-center justify-center shadow-sm"
@@ -2571,11 +4514,9 @@ const DashboardScreen: React.FC = () => {
                               {student.avatar}
                             </Text>
                           </View>
-                          {/* Online indicator (optional) */}
                           <View className="absolute -bottom-1 -right-1 w-4 h-4 bg-green-500 rounded-full border-2 border-white" />
                         </View>
 
-                        {/* Student Info */}
                         <View className="flex-1 ms-2" >
                           <Text className="font-bold text-gray-900 text-lg mb-1">
                             {student.name}
@@ -2587,17 +4528,13 @@ const DashboardScreen: React.FC = () => {
                               </Text>
                             </View>
                           </View>
-                          {/* Additional info row (optional) */}
-                         
                         </View>
                       </View>
                     </View>
                   </TouchableOpacity>
 
-                  {/* Action Buttons Section */}
                   <View className="px-4 pb-4">
                     <View className="flex-row space-x-3 gap-4">
-                      {/* Add Feedback Button */}
                       <TouchableOpacity 
                         onPress={() => handleGiveFeedback(student)}
                         className="flex-1 bg-blue-500 rounded-xl py-3 px-4 shadow-sm active:opacity-80"
@@ -2611,7 +4548,6 @@ const DashboardScreen: React.FC = () => {
                         </View>
                       </TouchableOpacity>
 
-                      {/* View History Button */}
                       <TouchableOpacity 
                         onPress={() => handleInstructorStudentPress(student)}
                         className="flex-1 bg-gray-100 rounded-xl py-3 px-4 border border-gray-200 active:opacity-80"
@@ -2627,13 +4563,11 @@ const DashboardScreen: React.FC = () => {
                     </View>
                   </View>
 
-                  {/* Quick Stats Bar (Optional Enhancement) */}
                   <View className="bg-gray-50 px-4 py-3 border-t border-gray-100">
                     <View className="flex-row justify-between items-center">
                       <View className="flex-row items-center space-x-4">
                         
                       </View>
-                      
                     </View>
                   </View>
                 </View>
@@ -2641,24 +4575,33 @@ const DashboardScreen: React.FC = () => {
             ))
           ) : (
             <View className="bg-white rounded-2xl shadow-sm p-8 mt-3 items-center">
-              <Ionicons name="search" size={48} color="#D1D5DB" />
-              <Text className="text-gray-500 text-lg font-medium mt-4">
+              <View className="w-16 h-16 bg-gradient-to-br from-blue-100 to-purple-100 rounded-full items-center justify-center mb-4">
+                <Ionicons name="search" size={32} color="#8B5CF6" />
+              </View>
+              <Text className="text-gray-500 text-lg font-medium mt-2">
                 No students found
               </Text>
               <Text className="text-gray-400 text-sm mt-2 text-center">
                 {searchQuery 
-                  ? `No students match "${searchQuery}"`
-                  : "No students available"
+                  ? `No students match "${searchQuery}". Try a different search term.`
+                  : "No students are available at the moment."
                 }
               </Text>
+              {searchQuery && (
+                <TouchableOpacity
+                  onPress={() => setSearchQuery('')}
+                  className="mt-4 bg-blue-500 px-6 py-2 rounded-xl"
+                >
+                  <Text className="text-white font-medium">Clear Search</Text>
+                </TouchableOpacity>
+              )}
             </View>
           )}          
         </View>
       </ScrollView>
     </SafeAreaView>
   );
-};
-  // 1. Add these new screens to your main component
+};  // 1. Add these new screens to your main component
 
   const EditStudentScreen: React.FC = () => {
     const navigation = useNavigation();
@@ -2876,21 +4819,7 @@ const AdminStudentsScreen: React.FC = () => {
                         Mother Phone: {student.mother_phone}
                       </Text>
                     )}
-                    {student.in_person_name && (
-                      <Text className="text-xs text-gray-500">
-                        Mother Phone: {student.in_person_name}
-                      </Text>
-                    )}
-                    {student.online_instructor_name && (
-                      <Text className="text-xs text-gray-500">
-                        Mother Phone: {student.online_instructor_name}
-                      </Text>
-                    )}
-                    {student.online_instructor_name && (
-                      <Text className="text-xs text-gray-500">
-                        Mother Phone: {student.online_instructor_name}
-                      </Text>
-                    )}
+
                     {student.password && (
                       <Text className="text-xs text-gray-500">
                         Password: {student.password}
@@ -2955,7 +4884,7 @@ const FileSelector: React.FC<{
       setLoading(true);
       
       // Build query - adjust table name and filtering as needed
-      let query = supabase.from('folders').select('files');
+      let query = supabase.from('subfolders').select('files');
       
       // Optional: Add filtering by student ID if needed
       // if (studentId) {
@@ -3022,9 +4951,24 @@ const FileSelector: React.FC<{
       day: 'numeric',
     });
   };
+// Add these state variables to your component
+const [searchQuery, setSearchQuery] = useState('');
+
+// Filter files based on search query
+const filteredFiles = useMemo(() => {
+  if (!searchQuery.trim()) {
+    return files;
+  }
+  
+  return files.filter(file => 
+    file.name.toLowerCase().includes(searchQuery.toLowerCase()) ||
+    file.type?.toLowerCase().includes(searchQuery.toLowerCase())
+  );
+}, [files, searchQuery]);
 
   // Render file item
   const renderFileItem = ({ item }: { item: FileItem }) => (
+    
     <TouchableOpacity
       onPress={() => {
         onFileSelect(item);
@@ -3045,7 +4989,7 @@ const FileSelector: React.FC<{
           />
         </View>
         
-        <View className="flex-1">
+        <View className="flex-1 ms-2">
           <Text 
             className={`font-medium text-sm ${
               selectedFile?.id === item.id ? 'text-blue-800' : 'text-gray-800'
@@ -3112,53 +5056,105 @@ const FileSelector: React.FC<{
         )}
       </TouchableOpacity>
 
-      {/* File Selection Modal */}
-      <Modal
-        visible={modalVisible}
-        animationType="slide"
-        presentationStyle="pageSheet"
+{/* File Selection Modal */}
+<Modal
+  visible={modalVisible}
+  animationType="slide"
+  presentationStyle="pageSheet"
+>
+  <View className="flex-1 bg-white">
+    {/* Modal Header */}
+    <View className="flex-row items-center justify-between p-4 border-b border-gray-200">
+      <Text className="text-lg font-bold text-gray-800">
+        Select File
+      </Text>
+      <TouchableOpacity
+        onPress={() => {
+          setModalVisible(false);
+          setSearchQuery(''); // Clear search when closing modal
+        }}
+        className="w-8 h-8 bg-gray-100 rounded-full items-center justify-center"
       >
-        <View className="flex-1 bg-white">
-          {/* Modal Header */}
-          <View className="flex-row items-center justify-between p-4 border-b border-gray-200">
-            <Text className="text-lg font-bold text-gray-800">
-              Select File
-            </Text>
-            <TouchableOpacity
-              onPress={() => setModalVisible(false)}
-              className="w-8 h-8 bg-gray-100 rounded-full items-center justify-center"
-            >
-              <Ionicons name="close" as any size={20} color="#6B7280" />
-            </TouchableOpacity>
-          </View>
+        <Ionicons name="close" size={20} color="#6B7280" />
+      </TouchableOpacity>
+    </View>
 
-          {/* Files List */}
-          {loading ? (
-            <View className="flex-1 items-center justify-center">
-              <ActivityIndicator size="large" color="#3B82F6" />
-              <Text className="text-gray-600 mt-2">Loading files...</Text>
-            </View>
-          ) : files.length > 0 ? (
-            <FlatList
-              data={files}
-              keyExtractor={(item) => item.id}
-              renderItem={renderFileItem}
-              showsVerticalScrollIndicator={false}
-            />
-          ) : (
-            <View className="flex-1 items-center justify-center p-8">
-              <Ionicons name="folder-open-outline" as any size={48} color="#9CA3AF" />
-              <Text className="text-gray-500 text-center mt-4">
-                No files available
-              </Text>
-              <Text className="text-gray-400 text-center text-sm mt-2">
-                Files will appear here once uploaded
-              </Text>
-            </View>
-          )}
-        </View>
-      </Modal>
-    </>
+    {/* Search Bar */}
+    <View className="px-4 py-3 bg-gray-50 border-b border-gray-200">
+      <View className="flex-row items-center bg-white rounded-lg border border-gray-300 px-3 py-2">
+        <Ionicons name="search" size={20} color="#9CA3AF" />
+        <TextInput
+          placeholder="Search files..."
+          value={searchQuery}
+          onChangeText={setSearchQuery}
+          className="flex-1 ml-2 text-gray-800"
+          placeholderTextColor="#9CA3AF"
+          returnKeyType="search"
+        />
+        {searchQuery.length > 0 && (
+          <TouchableOpacity
+            onPress={() => setSearchQuery('')}
+            className="ml-2"
+          >
+            <Ionicons name="close-circle" size={20} color="#9CA3AF" />
+          </TouchableOpacity>
+        )}
+      </View>
+      
+      {/* Search Results Count */}
+      {searchQuery.length > 0 && !loading && (
+        <Text className="text-sm text-gray-600 mt-2">
+          {filteredFiles.length} {filteredFiles.length === 1 ? 'file' : 'files'} found
+        </Text>
+      )}
+    </View>
+
+    {/* Files List */}
+    {loading ? (
+      <View className="flex-1 items-center justify-center">
+        <ActivityIndicator size="large" color="#3B82F6" />
+        <Text className="text-gray-600 mt-2">Loading files...</Text>
+      </View>
+    ) : filteredFiles.length > 0 ? (
+      <FlatList
+        data={filteredFiles}
+        keyExtractor={(item) => item.id}
+        renderItem={renderFileItem}
+        showsVerticalScrollIndicator={false}
+        keyboardShouldPersistTaps="handled"
+      />
+    ) : searchQuery.length > 0 ? (
+      // No search results
+      <View className="flex-1 items-center justify-center p-8">
+        <Ionicons name="search" size={48} color="#9CA3AF" />
+        <Text className="text-gray-500 text-center mt-4 text-lg">
+          No files found
+        </Text>
+        <Text className="text-gray-400 text-center text-sm mt-2">
+          Try adjusting your search terms
+        </Text>
+        <TouchableOpacity
+          onPress={() => setSearchQuery('')}
+          className="mt-4 px-4 py-2 bg-blue-500 rounded-lg"
+        >
+          <Text className="text-white font-medium">Clear Search</Text>
+        </TouchableOpacity>
+      </View>
+    ) : (
+      // No files available
+      <View className="flex-1 items-center justify-center p-8">
+        <Ionicons name="folder-open-outline" size={48} color="#9CA3AF" />
+        <Text className="text-gray-500 text-center mt-4">
+          No files available
+        </Text>
+        <Text className="text-gray-400 text-center text-sm mt-2">
+          Files will appear here once uploaded
+        </Text>
+      </View>
+    )}
+  </View>
+</Modal>
+  </>
   );
 };
 
@@ -4565,11 +6561,12 @@ const renderSessionInfo = (session: any) => {
     // Add the StudentDashboardScreen component
     const StudentDashboardScreen: React.FC = () => {
       
-      const navigation = useNavigation();
+const navigation = useNavigation();
 
-      useLayoutEffect(() => {
-        navigation.setOptions({ headerShown: false });
-      }, [navigation]);
+useLayoutEffect(() => {
+  navigation.setOptions({ headerShown: false });
+}, [navigation]);
+
 // Add this state to fetch session information
 const [sessionInfo, setSessionInfo] = useState({
   online_theory_meet: '',
@@ -4584,7 +6581,6 @@ const fetchSessionInfo = async () => {
   const { data, error } = await supabase
     .from("feedback")
     .select("Online_Theory_Meet , Online_Practice_Meet, In_person_Location ")
-    .eq("student_id", studentProfile.id)
     .limit(1)
     .single();
 console.log(studentProfile.id)
@@ -4599,102 +6595,199 @@ console.log(studentProfile.id)
   }
 };
 
+// Add this interface after your existing interfaces
+interface FeedbackFile {
+  id: string;
+  name: string;
+  url: string;
+  session_number: number;
+  session_type: string;
+  created_at: string;
+  instructor_id: string;
+  isStudied?: boolean;
+  studiedAt?: string;
+}
+
+// Add this state variable after your existing state variables
+const [feedbackFiles, setFeedbackFiles] = useState<FeedbackFile[]>([]);
+const [expandedFolders, setExpandedFolders] = useState<Set<string>>(new Set());
+const [filterType, setFilterType] = useState<'all' | 'studied' | 'unstudied'>('all');
+const [searchQuery, setSearchQuery] = useState<string>('');
+
+// Add this function after your fetchSessionInfo function
+const fetchFeedbackFiles = async (): Promise<void> => {
+  if (!studentProfile?.id) return;
+
+  const { data, error } = await supabase
+    .from("feedback")
+    .select("id, sheet, session_number, session_type, created_at, instructor_id")
+    .eq("student_id", studentProfile.id)
+    .not("sheet", "is", null)
+    .not("sheet", "eq", "")
+    .order("created_at", { ascending: false });
+
+  if (error) {
+    console.error("Error fetching feedback files:", error);
+  } else {
+    const processedFiles: FeedbackFile[] = (data || []).map((item: any) => ({
+      id: item.id,
+      name: `Session ${item.session_number} - ${formatSessionType(item.session_type)} Sheet`,
+      url: item.sheet,
+      session_number: item.session_number,
+      session_type: item.session_type,
+      created_at: item.created_at,
+      instructor_id: item.instructor_id,
+      isStudied: false, // You can track this separately if needed
+    }));
+    setFeedbackFiles(processedFiles);
+  }
+};
+
+// Update your existing useEffect to fetch feedback files
+useEffect(() => {
+  fetchFeedbackFiles();
+}, [studentProfile?.id]);
+
+const toggleFolderExpansion = (folderId: string): void => {
+  const newExpanded = new Set(expandedFolders);
+  if (newExpanded.has(folderId)) {
+    newExpanded.delete(folderId);
+  } else {
+    newExpanded.add(folderId);
+  }
+  setExpandedFolders(newExpanded);
+};
+
+// Add this new function to get filtered feedback files
+const getFilteredFeedbackFiles = (): FeedbackFile[] => {
+  let filtered = feedbackFiles;
+
+  // Apply search filter
+  if (searchQuery.trim()) {
+    filtered = filtered.filter(file => 
+      file.name.toLowerCase().includes(searchQuery.toLowerCase())
+    );
+  }
+
+  // Apply study status filter
+  if (filterType !== 'all') {
+    filtered = filtered.filter(file => {
+      if (filterType === 'studied') return file.isStudied;
+      if (filterType === 'unstudied') return !file.isStudied;
+      return true;
+    });
+  }
+
+  return filtered;
+};
+
+// Add this function to mark feedback files as studied
+const markFeedbackFileAsStudied = async (fileId: string, fileIndex: number): Promise<void> => {
+  try {
+    const updatedFiles = [...feedbackFiles];
+    const currentFile = updatedFiles[fileIndex];
+    
+    updatedFiles[fileIndex] = {
+      ...currentFile,
+      isStudied: !currentFile.isStudied,
+      studiedAt: !currentFile.isStudied ? new Date().toISOString() : undefined
+    };
+    
+    setFeedbackFiles(updatedFiles);
+
+    // You can add database update here if you want to persist the study status
+    // await supabase.from('feedback_study_status').upsert({ 
+    //   feedback_id: fileId, 
+    //   student_id: studentProfile.id, 
+    //   is_studied: !currentFile.isStudied 
+    // });
+    
+  } catch (error) {
+    console.error("Error updating feedback file study status:", error);
+    Alert.alert("Error", "Failed to update study status");
+  }
+};
+
+// Update the Results Summary calculation in your JSX
+const getTotalFileCounts = () => {
+  const feedbackFilesCount = getFilteredFeedbackFiles().length;
+  const totalFiles = feedbackFilesCount;
+  
+  const studiedFeedbackFiles = getFilteredFeedbackFiles().filter(f => f.isStudied).length;
+  const studiedFiles = studiedFeedbackFiles;
+  
+  return { totalFiles, studiedFiles };
+};
+
 // Add this useEffect to fetch session info
 useEffect(() => {
   fetchSessionInfo();
 }, [studentProfile?.id]);
 
+const formatSessionType = (type: string) => {
+  switch (type) {
+    case "in_person":
+      return "In-Person";
+    case "online_instrument":
+      return "Online Practice";
+    case "theory":
+      return "Theory";
+    default:
+      return type;
+  }
+};
 
-      const getSessionTypeIcon = (type: string) => {
-        switch (type) {
-          case "in_person":
-            return "people";
-          case "online_instrument":
-            return "musical-notes";
-          case "theory":
-            return "book";
-          default:
-            return "musical-notes";
-        }
-      };
+const [instructorNames, setInstructorNames] = useState<
+  Record<string, string>
+>({});
 
-      const getSessionTypeColor = (type: string) => {
-        switch (type) {
-          case "In-Person":
-            return "#10B981";
-          case "Online":
-            return "#ce9a20ff";
-          case "Theory":
-            return "#f50bb3ff";
-          default:
-            return "#000000ff";
-        }
-      };
+useEffect(() => {
+  const fetchAllInstructorNames = async () => {
+    const names = { ...instructorNames };
 
-      const formatSessionType = (type: string) => {
-        switch (type) {
-          case "in_person":
-            return "In-Person";
-          case "online_instrument":
-            return "Online Practice";
-          case "theory":
-            return "Theory";
-          default:
-            return type;
-        }
-      };
+    for (const session of recentSessions) {
+      const id = session.instructor_id;
+      if (id && !names[id]) {
+        const name = await getInstructorName(id);
+        names[id] = name || "Unknown";
+      }
+    }
 
-      const [instructorNames, setInstructorNames] = useState<
-        Record<string, string>
-      >({});
+    setInstructorNames(names);
+  };
 
-      useEffect(() => {
-        const fetchAllInstructorNames = async () => {
-          const names = { ...instructorNames };
+  if (recentSessions.length > 0) {
+    fetchAllInstructorNames();
+  }
+}, [recentSessions]);
 
-          for (const session of recentSessions) {
-            const id = session.instructor_id;
-            if (id && !names[id]) {
-              const name = await getInstructorName(id);
-              names[id] = name || "Unknown";
-            }
-          }
+const scrollViewRef = useRef<ScrollView>(null);
+const hasScrolledRef = useRef(false);
 
-          setInstructorNames(names);
-        };
+const fetchStudentFeedback = async () => {
+  if (!studentProfile?.id) return;
 
-        if (recentSessions.length > 0) {
-          fetchAllInstructorNames();
-        }
-      }, [recentSessions]);
+  const { data, error } = await supabase
+    .from("feedback")
+    .select("*")
+    .eq("student_id", studentProfile.id)
+    .order("created_at", { ascending: false });
 
-      const scrollViewRef = useRef<ScrollView>(null);
-      const hasScrolledRef = useRef(false);
+  if (error) {
+    console.error("Error fetching feedback:", error);
+  } else {
+    if (JSON.stringify(data) !== JSON.stringify(recentSessions)) {
+      setRecentSessions(data);
+      hasScrolledRef.current = false; 
+    }
+  }
 
-      const fetchStudentFeedback = async () => {
-        if (!studentProfile?.id) return;
+  setDataLoaded(true);
+};
 
-        const { data, error } = await supabase
-          .from("feedback")
-          .select("*")
-          .eq("student_id", studentProfile.id)
-          .order("created_at", { ascending: false });
-
-        if (error) {
-          console.error("Error fetching feedback:", error);
-        } else {
-          if (JSON.stringify(data) !== JSON.stringify(recentSessions)) {
-            setRecentSessions(data);
-            hasScrolledRef.current = false; 
-          }
-        }
-
-        setDataLoaded(true);
-      };
-
-      useEffect(() => {
-        fetchStudentFeedback();
-      }, [studentProfile?.id]);
+useEffect(() => {
+  fetchStudentFeedback();
+}, [studentProfile?.id]);
 
       const renderStars = (rating: number) => {
         return (
@@ -4764,6 +6857,269 @@ useEffect(() => {
               onScrollEndDrag={handleScrollEnd}
               scrollEventThrottle={16}
             >
+            {/* Study Materials Section */}
+{/* Study Materials Section */}
+<Animated.View className="bg-white rounded-2xl shadow-sm p-6 mb-4">
+  <Text className="text-lg font-bold text-gray-800 mb-4">
+    Study Materials
+  </Text>
+
+  {/* Search and Filter Controls */}
+  <View className="mb-4 space-y-3">
+    {/* Search Bar */}
+    <View className="flex-row items-center bg-gray-50 rounded-lg mb-2 px-3 py-2">
+      <Ionicons name="search" size={20} color="#6B7280" />
+      <TextInput
+        className="flex-1 ml-2 text-gray-700"
+        placeholder="Search files and folders..."
+        value={searchQuery}
+        onChangeText={setSearchQuery}
+        placeholderTextColor="#9CA3AF"
+      />
+      {searchQuery.length > 0 && (
+        <TouchableOpacity onPress={() => setSearchQuery('')}>
+          <Ionicons name="close-circle" size={20} color="#6B7280" />
+        </TouchableOpacity>
+      )}
+    </View>
+
+    {/* Filter Buttons */}
+    <View className="flex-row gap-2 mb-2 space-x-2">
+      <TouchableOpacity
+        className={`px-3 py-2 rounded-lg flex-row items-center ${
+          filterType === 'all' ? 'bg-blue-500' : 'bg-gray-100'
+        }`}
+        onPress={() => setFilterType('all')}
+      >
+        <Ionicons 
+          name="list" 
+          size={14} 
+          color={filterType === 'all' ? 'white' : '#6B7280'} 
+        />
+        <Text className={`ml-1 text-xs font-medium ${
+          filterType === 'all' ? 'text-white' : 'text-gray-600'
+        }`}>
+          All
+        </Text>
+      </TouchableOpacity>
+
+      <TouchableOpacity
+        className={`px-3 py-2 rounded-lg flex-row items-center ${
+          filterType === 'studied' ? 'bg-green-500' : 'bg-gray-100'
+        }`}
+        onPress={() => setFilterType('studied')}
+      >
+        <Ionicons 
+          name="checkmark-circle" 
+          size={14} 
+          color={filterType === 'studied' ? 'white' : '#6B7280'} 
+        />
+        <Text className={`ml-1 text-xs font-medium ${
+          filterType === 'studied' ? 'text-white' : 'text-gray-600'
+        }`}>
+          Studied
+        </Text>
+      </TouchableOpacity>
+
+      <TouchableOpacity
+        className={`px-3 py-2 rounded-lg flex-row items-center ${
+          filterType === 'unstudied' ? 'bg-orange-500' : 'bg-gray-100'
+        }`}
+        onPress={() => setFilterType('unstudied')}
+      >
+        <Ionicons 
+          name="time" 
+          size={14} 
+          color={filterType === 'unstudied' ? 'white' : '#6B7280'} 
+        />
+        <Text className={`ml-1 text-xs font-medium ${
+          filterType === 'unstudied' ? 'text-white' : 'text-gray-600'
+        }`}>
+          To Study
+        </Text>
+      </TouchableOpacity>
+    </View>
+
+    <View className="flex-row items-center justify-between">
+      <Text className="text-sm text-gray-600">
+        {(() => {
+          const { totalFiles, studiedFiles } = getTotalFileCounts();
+          return `${totalFiles} files • ${studiedFiles} studied`;
+        })()}
+      </Text>
+      
+      {(searchQuery || filterType !== 'all') && (
+        <TouchableOpacity
+          onPress={() => {
+            setSearchQuery('');
+            setFilterType('all');
+          }}
+          className="flex-row items-center"
+        >
+          <Text className="text-sm text-blue-600 mr-1">Clear filters</Text>
+          <Ionicons name="refresh" size={14} color="#2563EB" />
+        </TouchableOpacity>
+      )}
+    </View>
+  </View>
+
+  {/* Feedback Files Section */}
+  {getFilteredFeedbackFiles().length > 0 ? (
+    <View className="border border-gray-200 rounded-lg overflow-hidden mb-4">
+      {/* Feedback Files Header - Clickable */}
+      <TouchableOpacity
+        className="p-4 bg-gradient-to-r from-indigo-50 to-blue-50"
+        onPress={() => toggleFolderExpansion('feedback-files')}
+      >
+        <View className="flex-row items-center justify-between">
+          <View className="flex-row items-center flex-1">
+            <View className="w-8 h-8 bg-gradient-to-br from-indigo-400 to-indigo-600 rounded-lg items-center justify-center mr-3 shadow-sm">
+              <Ionicons name="document-text" size={16} color="white" />
+            </View>
+            <View className="flex-1">
+              <Text className="text-base font-semibold text-gray-800">
+                Session Sheets
+              </Text>
+              <Text className="text-sm text-gray-600 mt-1">
+                Sheet music from your sessions
+              </Text>
+            </View>
+          </View>
+
+          <View className="flex-row items-center space-x-2">
+            <View className="bg-white rounded-full px-2 py-1">
+              <Text className="text-xs text-gray-600 font-medium">
+                {getFilteredFeedbackFiles().length} files
+              </Text>
+            </View>
+            <Ionicons
+              name={expandedFolders.has('feedback-files') ? "chevron-up" : "chevron-down"}
+              size={20}
+              color="#6B7280"
+            />
+          </View>
+        </View>
+      </TouchableOpacity>
+
+      {/* Feedback Files List - Only show if expanded */}
+      {expandedFolders.has('feedback-files') && (
+        <View className="bg-white">
+          {getFilteredFeedbackFiles().map((file: FeedbackFile, fileIndex: number) => (
+            <View
+              key={file.id}
+              className="border-t border-gray-100 p-4"
+            >
+              {/* File Header */}
+              <View className="flex-row items-center justify-between">
+                <View className="flex-row items-center flex-1">
+                  <View className="w-10 h-10 rounded-xl items-center justify-center mr-3 shadow-sm bg-red-500">
+                    <Ionicons name="document-text" size={18} color="white" />
+                  </View>
+                  
+                  <View className="flex-1">
+                    <Text className="text-sm font-medium text-gray-800" numberOfLines={1}>
+                      {file.name}
+                    </Text>
+                    <Text className="text-xs text-gray-500">
+                      {new Date(file.created_at).toLocaleDateString()} • 
+                      {instructorNames[file.instructor_id] || "Loading..."}
+                    </Text>
+                    {file.isStudied && file.studiedAt && (
+                      <Text className="text-xs text-green-600 mt-1">
+                        ✓ Studied on {new Date(file.studiedAt).toLocaleDateString()}
+                      </Text>
+                    )}
+                  </View>
+                </View>
+                
+                {/* Study Status Indicator */}
+                <View className="mr-3">
+                  {file.isStudied ? (
+                    <View className="w-6 h-6 bg-green-500 rounded-full items-center justify-center">
+                      <Ionicons name="checkmark" size={14} color="white" />
+                    </View>
+                  ) : (
+                    <View className="w-6 h-6 border-2 border-gray-300 rounded-full" />
+                  )}
+                </View>
+              </View>
+
+              {/* Action Buttons */}
+              <View className="flex-row items-center justify-between mt-3">
+                <View className="flex-row space-x-2">
+                  {/* Mark as Studied Button */}
+                  <TouchableOpacity
+                    className={`px-3 py-2 me-2 rounded-lg flex-row items-center ${
+                      file.isStudied 
+                        ? 'bg-green-50 border border-green-200' 
+                        : 'bg-orange-50 border border-orange-200'
+                    }`}
+                    onPress={() => markFeedbackFileAsStudied(file.id, fileIndex)}
+                  >
+                    <Ionicons 
+                      name={file.isStudied ? "checkmark-circle" : "time"} 
+                      size={14} 
+                      color={file.isStudied ? "#10B981" : "#F59E0B"} 
+                    />
+                    <Text className={`ml-1 text-xs font-medium ${
+                      file.isStudied ? 'text-green-700' : 'text-orange-700'
+                    }`}>
+                      {file.isStudied ? 'Studied' : 'Mark Studied'}
+                    </Text>
+                  </TouchableOpacity>
+
+                  {/* View Button */}
+                  <TouchableOpacity
+                    className="bg-blue-50 border border-blue-200 px-3 py-2 rounded-lg flex-row items-center"
+                    onPress={async (): Promise<void> => {
+                      if (file.url) {
+                        try {
+                          const supported: boolean = await Linking.canOpenURL(file.url);
+                          if (supported) {
+                            await Linking.openURL(file.url);
+                          } else {
+                            Alert.alert("Error", "Can't open this file");
+                          }
+                        } catch (error) {
+                          Alert.alert("Error", "Failed to open file");
+                        }
+                      }
+                    }}
+                  >
+                    <Ionicons name="eye" size={14} color="#2563EB" />
+                    <Text className="text-blue-700 text-xs ml-1 font-medium">View</Text>
+                  </TouchableOpacity>
+                </View>
+              </View>
+            </View>
+          ))}
+        </View>
+      )}
+    </View>
+  ) : (
+    <View className="items-center py-12">
+      <View className="w-16 h-16 bg-gray-100 rounded-full items-center justify-center mb-4">
+        <Ionicons
+          name={searchQuery || filterType !== 'all' ? "search" : "folder-open-outline"}
+          size={32}
+          color="#D1D5DB"
+        />
+      </View>
+      <Text className="text-gray-500 text-center font-medium">
+        {searchQuery || filterType !== 'all' 
+          ? 'No files match your search criteria' 
+          : 'No study materials available yet'
+        }
+      </Text>
+      <Text className="text-gray-400 text-sm text-center mt-1">
+        {searchQuery || filterType !== 'all'
+          ? 'Try adjusting your search or filters'
+          : 'Files will appear here when your instructor uploads them'
+        }
+      </Text>
+    </View>
+  )}
+</Animated.View>
 <Animated.View
   className="bg-white rounded-2xl shadow-sm p-6 mb-4"
 >
@@ -5182,12 +7538,15 @@ useEffect(() => {
         const screen = await AsyncStorage.getItem("initialScreen");
 
         if (keep === "true" && screen) {
+          console.log(screen)
           setCurrentScreen(screen as any); // أو استبدل `any` بالنوع المناسب
         } else {
           setCurrentScreen("login");
+          console.log("login")
         }
       } catch (error) {
         console.error("Failed to restore screen:", error);
+        console.log("login")
         setCurrentScreen("login");
       }
     };
